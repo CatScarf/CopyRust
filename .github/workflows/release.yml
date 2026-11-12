@@ -7,6 +7,11 @@ on:
   pull_request:
   workflow_dispatch:
     inputs:
+      publish_rust:
+        description: Publish the current validated Rust crates only
+        required: false
+        default: false
+        type: boolean
       artifact_run_id:
         description: Existing validated run to publish Python wheels from; empty runs checks
         required: false
@@ -21,7 +26,7 @@ concurrency:
 
 jobs:
   build:
-    if: github.event_name != 'workflow_dispatch' || inputs.artifact_run_id == ''
+    if: github.event_name != 'workflow_dispatch' || (inputs.artifact_run_id == '' && !inputs.publish_rust)
     strategy:
       fail-fast: false
       matrix:
@@ -156,3 +161,15 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: temp/wheels
+
+  publish-existing-rust:
+    if: github.event_name == 'workflow_dispatch' && inputs.publish_rust
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Publish validated Rust packages
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          cargo publish --locked -p copyrust
+          cargo publish --locked -p copyrust-cli
