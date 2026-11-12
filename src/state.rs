@@ -8,7 +8,7 @@ use std::sync::{
 };
 use std::time::Instant;
 
-/// Cooperatively stop scanning, hashing, and copying without truncating destinations.
+/// Request cooperative cancellation during scanning, hashing, and copying.
 #[derive(Clone, Default)]
 pub struct Cancellation(Arc<AtomicBool>);
 
@@ -34,6 +34,7 @@ impl Cancellation {
 
 pub(crate) struct State {
     pub progress: Mutex<Progress>,
+    pub scanned: AtomicU64,
     pub hashed: AtomicU64,
     pub copied: AtomicU64,
     pub errors: Mutex<Vec<String>>,
@@ -51,6 +52,7 @@ impl State {
                 dry_run: options.dry_run,
                 ..Progress::default()
             }),
+            scanned: AtomicU64::new(0),
             hashed: AtomicU64::new(0),
             copied: AtomicU64::new(0),
             errors: Mutex::new(Vec::new()),
@@ -58,6 +60,15 @@ impl State {
             parents: Mutex::new(HashSet::new()),
             started: Instant::now(),
         }
+    }
+
+    /// Reuse existing destination directories only after all ancestors pass planning checks.
+    pub(crate) fn remember_parents(&self, paths: Vec<PathBuf>) -> Result<()> {
+        self.parents
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Failed to lock validated directories: {e}"))?
+            .extend(paths);
+        Ok(())
     }
 
     /// Validate shared directory topology once per batch and create missing copy parents.
@@ -96,6 +107,7 @@ impl State {
             .map_err(|e| anyhow::anyhow!("Failed to read progress: {e}"))?
             .clone();
         progress.elapsed_seconds = self.started.elapsed().as_secs_f64();
+        progress.scanned_files = self.scanned.load(Ordering::Relaxed);
         progress.hashed_bytes = self.hashed.load(Ordering::Relaxed);
         progress.copied_bytes = self.copied.load(Ordering::Relaxed);
         Ok(progress)

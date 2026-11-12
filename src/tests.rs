@@ -424,3 +424,57 @@ fn transfer_modes_replace_longer_destinations() -> Result<()> {
     }
     Ok(())
 }
+
+/// One directory mapping produces identical filtered inventories at every scan concurrency.
+#[test]
+fn single_tree_parallel_scans_preserve_selection() -> Result<()> {
+    for workers in [1, 2, 8, 16] {
+        let mut fixture = Fixture::new()?;
+        fixture.job.options.exclude_dirs = vec!["ignored".into()];
+        fixture.job.options.exclude_files = vec!["*.tmp".into()];
+        for index in 0..24 {
+            Fixture::put(
+                &fixture.job.source,
+                &format!("dir-{index}/deep/file"),
+                b"parallel",
+            )?;
+            Fixture::put(
+                &fixture.job.source,
+                &format!("dir-{index}/omit.tmp"),
+                b"omit",
+            )?;
+        }
+        Fixture::put(&fixture.job.source, "ignored/file", b"omit")?;
+        Fixture::put(&fixture.job.source, ".hidden/file", b"retain")?;
+        let options = RunOptions {
+            scan_workers: workers,
+            retries: 0,
+            ..RunOptions::default()
+        };
+        let first = CopyEngine::run(
+            std::slice::from_ref(&fixture.job),
+            &options,
+            Cancellation::default(),
+            |_| Ok(()),
+        )?;
+        ensure!(
+            first.success()
+                && first.progress.copied_files == 25
+                && first.progress.scanned_files == 25
+        );
+        ensure!(!fixture.job.destination.join("ignored").exists());
+        let second = CopyEngine::run(
+            std::slice::from_ref(&fixture.job),
+            &options,
+            Cancellation::default(),
+            |_| Ok(()),
+        )?;
+        ensure!(
+            second.success()
+                && second.progress.skipped_mtime == 25
+                && second.progress.scanned_files == 25
+        );
+        ensure!(second.progress.copied_files == 0 && second.progress.hashed_bytes == 0);
+    }
+    Ok(())
+}

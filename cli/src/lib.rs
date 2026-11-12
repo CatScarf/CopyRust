@@ -63,7 +63,7 @@ pub struct Cli {
     /// Compare and plan all operations without modifying destination files.
     #[arg(long)]
     dry_run: bool,
-    /// Bound parallel source scans (default 8).
+    /// Bound directory enumeration workers across sources and destinations (default 8).
     #[arg(long)]
     scan_workers: Option<usize>,
     /// Bound concurrent complete-content comparisons (default 4).

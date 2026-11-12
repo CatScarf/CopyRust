@@ -37,6 +37,9 @@ impl Patterns {
 
     /// Match names anywhere and paths relative to the mapping's source root.
     pub(crate) fn matches(&self, path: &Path) -> bool {
+        if self.empty {
+            return false;
+        }
         path.file_name()
             .is_some_and(|name| self.names.is_match(Path::new(name)))
             || self.paths.is_match(path)

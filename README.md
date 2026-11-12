@@ -58,6 +58,10 @@ recursive = false
 include_files = ["*.uproject", "*.bat"]
 ```
 
+`--scan-workers` bounds directory enumeration within each tree and across all mappings,
+including destination metadata collection. The default is 8; higher values can add
+scheduling overhead on small trees.
+
 CLI options override each TOML job; job exclusions append to defaults. Job include
 patterns replace default includes. Relative paths resolve against the working
 directory. Globs without `/` match basenames anywhere. Globs with `/` match paths
