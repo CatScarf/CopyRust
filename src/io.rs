@@ -70,6 +70,18 @@ impl Paths {
         }
     }
 
+    /// Normalize filename keys without allocating for unchanged ASCII spellings.
+    pub(crate) fn name_key(name: &std::ffi::OsStr) -> std::borrow::Cow<'_, str> {
+        let value = name.to_string_lossy();
+        if cfg!(windows)
+            && (!value.is_ascii() || value.bytes().any(|byte| byte.is_ascii_uppercase()))
+        {
+            std::borrow::Cow::Owned(value.to_lowercase())
+        } else {
+            value
+        }
+    }
+
     /// Compare complete path components rather than textual prefixes.
     pub(crate) fn within(path: &Path, root: &Path) -> bool {
         Path::new(&Self::key(path)).starts_with(Self::key(root))
@@ -165,7 +177,7 @@ impl Content {
     /// Read a complete digest while checking cancellation and source stability.
     fn digest(
         path: &Path,
-        before: &Metadata,
+        before: &crate::filesystem::Snapshot,
         algorithm: HashAlgorithm,
         state: &state::State,
     ) -> Result<hashing::Digest> {
@@ -187,16 +199,22 @@ impl Content {
             hash.update(&buffer[..count]);
             state.hashed.fetch_add(count as u64, Ordering::Relaxed);
         }
-        Self::unchanged(path, before).context("Hash input changed during comparison")?;
+        Self::unchanged(
+            path,
+            before.len(),
+            before
+                .modified()
+                .context("Failed to read digest input mtime")?,
+        )
+        .context("Hash input changed during comparison")?;
         Ok(hash.finish())
     }
 
     /// Reject observed mutations instead of silently accepting a partial file.
-    fn unchanged(path: &Path, before: &Metadata) -> Result<()> {
+    fn unchanged(path: &Path, size: u64, modified: std::time::SystemTime) -> Result<()> {
         let after = fs::metadata(path).context("Failed to recheck file metadata")?;
-        if before.len() != after.len()
-            || before.modified().context("Failed to read initial mtime")?
-                != after.modified().context("Failed to read final mtime")?
+        if size != after.len()
+            || modified != after.modified().context("Failed to read final mtime")?
         {
             bail!("File changed during operation: {}", path.display());
         }
@@ -217,17 +235,20 @@ impl Content {
         let Some(destination) = &entry.destination_metadata else {
             return Ok(true);
         };
-        if Paths::is_link(destination) {
+        if destination.is_link() {
             bail!(
                 "Destination link traversal is disabled: {}",
-                entry.destination.display()
+                entry.destination().display()
             );
         }
         if !destination.is_file() {
-            bail!("Destination is not a file: {}", entry.destination.display());
+            bail!(
+                "Destination is not a file: {}",
+                entry.destination().display()
+            );
         }
         if options.compare == Compare::Always {
-            if same_file::is_same_file(&entry.source, &entry.destination)
+            if same_file::is_same_file(entry.source(), entry.destination())
                 .context("Failed to compare file identities")?
             {
                 state.update(|p| p.skipped_same_file += 1)?;
@@ -238,10 +259,9 @@ impl Content {
         if source.len() != destination.len() {
             return Ok(true);
         }
-        let same_time = source.modified().context("Failed to read source mtime")?
-            == destination
-                .modified()
-                .context("Failed to read destination mtime")?;
+        let same_time = source
+            .same_time(destination)
+            .context("Failed to compare modification times")?;
         if matches!(options.compare, Compare::Mtime | Compare::Auto) && same_time {
             state.update(|p| p.skipped_mtime += 1)?;
             return Ok(false);
@@ -249,9 +269,9 @@ impl Content {
         if options.compare == Compare::Mtime {
             return Ok(true);
         }
-        if Self::digest(&entry.source, source, options.hash_algorithm, state)?
+        if Self::digest(entry.source(), source, options.hash_algorithm, state)?
             == Self::digest(
-                &entry.destination,
+                entry.destination(),
                 destination,
                 options.hash_algorithm,
                 state,
@@ -270,16 +290,16 @@ impl Content {
         state: &state::State,
     ) -> Result<()> {
         state.parent(
-            entry.source.parent().context("Source has no parent")?,
+            entry.source().parent().context("Source has no parent")?,
             false,
         )?;
-        let before = Paths::leaf(&entry.source)?.context("Source disappeared before copying")?;
+        let before = Paths::leaf(entry.source())?.context("Source disappeared before copying")?;
         let parent = entry
-            .destination
+            .destination()
             .parent()
             .context("Destination has no parent")?;
         state.parent(parent, true)?;
-        Paths::leaf(&entry.destination)?;
+        Paths::leaf(entry.destination())?;
         state
             .cancellation
             .check()
@@ -293,7 +313,7 @@ impl Content {
         } else {
             None
         };
-        let output = temporary.as_deref().unwrap_or(&entry.destination);
+        let output = temporary.as_deref().unwrap_or(entry.destination());
         #[cfg(unix)]
         if !options.atomic {
             use std::os::unix::fs::PermissionsExt;
@@ -309,7 +329,7 @@ impl Content {
         if !options.atomic {
             crate::windows::NativeCopy::make_writable(output)?;
         }
-        Self::transfer(&entry.source, output, before.len(), state)
+        Self::transfer(entry.source(), output, before.len(), state)
             .context("Failed to transfer file contents")?;
         Self::finish(entry, options, &before, temporary)
     }
@@ -321,8 +341,15 @@ impl Content {
         before: &Metadata,
         temporary: Option<tempfile::TempPath>,
     ) -> Result<()> {
-        let output = temporary.as_deref().unwrap_or(&entry.destination);
-        Self::unchanged(&entry.source, before).context("Failed to validate copied source")?;
+        let output = temporary.as_deref().unwrap_or(entry.destination());
+        Self::unchanged(
+            entry.source(),
+            before.len(),
+            before
+                .modified()
+                .context("Failed to read copied source mtime")?,
+        )
+        .context("Failed to validate copied source")?;
         #[cfg(not(windows))]
         if options.preserve_mtime {
             filetime::set_file_mtime(
@@ -336,17 +363,17 @@ impl Content {
             filetime::set_file_mtime(output, filetime::FileTime::now())
                 .context("Failed to set copied file write time")?;
         }
-        Paths::leaf(&entry.destination)?;
+        Paths::leaf(entry.destination())?;
         if let Some(temporary) = temporary {
-            Paths::replace(temporary, &entry.destination)?;
+            Paths::replace(temporary, entry.destination())?;
         }
         #[cfg(windows)]
         if before.permissions().readonly() {
-            fs::set_permissions(&entry.destination, before.permissions())
+            fs::set_permissions(entry.destination(), before.permissions())
                 .context("Failed to preserve source read-only attribute")?;
         }
         #[cfg(not(windows))]
-        fs::set_permissions(&entry.destination, before.permissions())
+        fs::set_permissions(entry.destination(), before.permissions())
             .context("Failed to preserve destination permissions")?;
         Ok(())
     }

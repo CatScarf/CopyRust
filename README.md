@@ -62,6 +62,10 @@ include_files = ["*.uproject", "*.bat"]
 including destination metadata collection. The default is 8; higher values can add
 scheduling overhead on small trees.
 
+On Windows, directory scans batch native metadata reads. Directory-local indexes
+verify full filenames after fingerprint matches, and unchanged metadata-only files
+avoid constructing complete paths. File-content hashing remains independent.
+
 CLI options override each TOML job; job exclusions append to defaults. Job include
 patterns replace default includes. Relative paths resolve against the working
 directory. Globs without `/` match basenames anywhere. Globs with `/` match paths

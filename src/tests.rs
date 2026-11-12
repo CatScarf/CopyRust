@@ -375,13 +375,13 @@ fn cancelled_transfer_keeps_original_file() -> Result<()> {
     fixture.job.options.atomic = true;
     Fixture::put(&fixture.job.source, "file", &vec![1u8; 1024 * 1024])?;
     Fixture::put(&fixture.job.destination, "file", b"original")?;
-    let entry = crate::plan::Entry {
-        source: fixture.job.source.join("file"),
-        destination: fixture.job.destination.join("file"),
-        job: 0,
-        source_metadata: fs::metadata(fixture.job.source.join("file"))?,
-        destination_metadata: Some(fs::metadata(fixture.job.destination.join("file"))?),
-    };
+    let entry = crate::plan::Entry::known(
+        fixture.job.source.join("file"),
+        fixture.job.destination.join("file"),
+        0,
+        fs::metadata(fixture.job.source.join("file"))?,
+        Some(fs::metadata(fixture.job.destination.join("file"))?),
+    );
     let cancellation = Cancellation::default();
     cancellation.cancel();
     let state = crate::state::State::new(&RunOptions::default(), cancellation);

@@ -145,7 +145,7 @@ impl CopyEngine {
                     let result =
                         io::Content::needs_copy(entry, &plan.jobs[entry.job].options, state)
                             .with_context(|| {
-                                format!("Failed to compare {}", entry.source.display())
+                                format!("Failed to compare {}", entry.source().display())
                             });
                     state.update(|progress| progress.compared_files += 1)?;
                     result
@@ -163,7 +163,7 @@ impl CopyEngine {
                     let result =
                         io::Content::needs_copy(entry, &plan.jobs[entry.job].options, state)
                             .with_context(|| {
-                                format!("Failed to compare {}", entry.source.display())
+                                format!("Failed to compare {}", entry.source().display())
                             });
                     state.update(|p| p.compared_files += 1)?;
                     result
@@ -205,7 +205,7 @@ impl CopyEngine {
                 }) {
                     Ok(()) => state.update(|p| p.copied_files += 1),
                     Err(error) => state.failure(
-                        error.context(format!("Failed to copy {}", entry.source.display())),
+                        error.context(format!("Failed to copy {}", entry.source().display())),
                     ),
                 }
             })

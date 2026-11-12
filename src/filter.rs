@@ -67,6 +67,15 @@ impl Filter {
         !self.dirs.matches(relative)
     }
 
+    /// Evaluate basename-only filters without constructing complete relative paths.
+    pub(crate) fn file_name(&self, name: &std::ffi::OsStr) -> Option<bool> {
+        if !self.excluded.paths.is_empty() || !self.included.paths.is_empty() {
+            None
+        } else {
+            Some(self.file(Path::new(name)))
+        }
+    }
+
     /// Select files using exclusions followed by an optional inclusion set.
     pub(crate) fn file(&self, relative: &Path) -> bool {
         !self.excluded.matches(relative) && (self.included.empty || self.included.matches(relative))

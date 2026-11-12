@@ -32,6 +32,35 @@ impl Cancellation {
     }
 }
 
+pub(crate) struct ScanCounter<'a> {
+    target: &'a AtomicU64,
+    pending: u64,
+}
+
+impl ScanCounter<'_> {
+    /// Amortize shared cache-line updates while preserving bounded progress latency.
+    pub(crate) fn increment(&mut self) {
+        self.pending += 1;
+        if self.pending == 64 {
+            self.flush();
+        }
+    }
+    /// Publish pending counts without locks or fallible cleanup.
+    fn flush(&mut self) {
+        if self.pending != 0 {
+            self.target.fetch_add(self.pending, Ordering::Relaxed);
+            self.pending = 0;
+        }
+    }
+}
+
+impl Drop for ScanCounter<'_> {
+    /// Preserve every selected file count on success, cancellation, or early failure.
+    fn drop(&mut self) {
+        self.flush();
+    }
+}
+
 pub(crate) struct State {
     pub progress: Mutex<Progress>,
     pub scanned: AtomicU64,
@@ -59,6 +88,14 @@ impl State {
             cancellation,
             parents: Mutex::new(HashSet::new()),
             started: Instant::now(),
+        }
+    }
+
+    /// Create one thread-local counting buffer for a directory scan.
+    pub(crate) fn scan_counter(&self) -> ScanCounter<'_> {
+        ScanCounter {
+            target: &self.scanned,
+            pending: 0,
         }
     }
 

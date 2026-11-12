@@ -1,28 +1,28 @@
-use crate::{CopyJob, filter::Filter, io::Paths, state::State};
+use crate::{CopyJob, filter::Filter, index, io::Paths, state::State};
 use anyhow::{Context, Result, bail};
 use rayon::prelude::*;
-use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     fs,
     path::{Path, PathBuf},
 };
 use walkdir::WalkDir;
 
-pub(crate) struct Entry {
-    pub source: PathBuf,
-    pub destination: PathBuf,
-    pub job: usize,
-    pub source_metadata: fs::Metadata,
-    pub destination_metadata: Option<fs::Metadata>,
-}
+pub(crate) use crate::entry::Entry;
 
 pub(crate) struct Removal {
     pub path: PathBuf,
     pub directory: bool,
 }
 
+struct Group {
+    destination: PathBuf,
+    files: std::ops::Range<usize>,
+}
+
 struct Tree {
+    groups: Vec<Group>,
     files: Vec<Entry>,
     directories: Vec<PathBuf>,
     present: HashSet<String>,
@@ -52,16 +52,9 @@ impl Plan {
                 .collect::<Result<_>>()
         })?;
 
-        let mut destinations = HashSet::new();
-        for tree in &trees {
-            for entry in &tree.files {
-                if !destinations.insert(Paths::key(&entry.destination)) {
-                    bail!("Multiple sources map to {}", entry.destination.display());
-                }
-            }
-        }
-
-        Self::validate_parents(&trees, &destinations, state)?;
+        let references: Vec<_> = trees.iter().flat_map(|tree| tree.files.iter()).collect();
+        let index = pool.install(|| Self::index(&trees, &references))?;
+        pool.install(|| index.validate(state, &references))?;
         let mut removals = Vec::new();
         for (index, tree) in trees.iter().enumerate() {
             removals.extend(
@@ -76,10 +69,14 @@ impl Plan {
             .collect();
         directories.sort();
         directories.dedup();
-        let mut files: Vec<_> = trees.into_iter().flat_map(|tree| tree.files).collect();
-
-        pool.install(|| Self::destination_snapshots(&mut files))
+        let snapshots = pool
+            .install(|| index.snapshot(&references))
             .context("Failed to snapshot destination metadata")?;
+        drop(references);
+        let mut files: Vec<_> = trees.into_iter().flat_map(|tree| tree.files).collect();
+        for (index, metadata) in snapshots.into_iter().flatten() {
+            files[index].destination_metadata = Some(metadata);
+        }
         Ok(Self {
             jobs,
             files,
@@ -88,106 +85,21 @@ impl Plan {
         })
     }
 
-    /// Reuse directory enumeration metadata instead of issuing one stat per candidate.
-    fn destination_snapshots(files: &mut [Entry]) -> Result<()> {
-        let mut directories: HashMap<PathBuf, HashMap<String, usize>> = HashMap::new();
-        for (index, entry) in files.iter().enumerate() {
-            let parent = entry
-                .destination
-                .parent()
-                .context("Destination has no parent")?;
-            let name = entry
-                .destination
-                .file_name()
-                .context("Destination has no filename")?;
-            directories
-                .entry(parent.into())
-                .or_default()
-                .insert(Paths::key(Path::new(name)), index);
-        }
-        let snapshots: Vec<Vec<(usize, fs::Metadata)>> = directories
-            .into_par_iter()
-            .map(|(directory, candidates)| Self::destination_directory(&directory, &candidates))
-            .collect::<Result<_>>()
-            .context("Failed to read parallel destination metadata")?;
-        for (index, metadata) in snapshots.into_iter().flatten() {
-            files[index].destination_metadata = Some(metadata);
-        }
-        Ok(())
-    }
-
-    /// Enumerate one target directory while retaining cached metadata for matching names.
-    fn destination_directory(
-        directory: &Path,
-        candidates: &HashMap<String, usize>,
-    ) -> Result<Vec<(usize, fs::Metadata)>> {
-        let entries = match fs::read_dir(directory) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(error) => return Err(error).context("Failed to enumerate destination directory"),
-        };
-        let mut result = Vec::new();
-        for entry in entries {
-            let entry = entry.context("Failed to read destination entry")?;
-            if let Some(index) = candidates.get(&Paths::key(Path::new(&entry.file_name()))) {
-                result.push((
-                    *index,
-                    entry
-                        .metadata()
-                        .context("Failed to read destination entry metadata")?,
-                ));
+    /// Retain directory group ranges while assigning globally stable file indexes.
+    fn index(trees: &[Tree], files: &[&Entry]) -> Result<index::DirectoryIndex> {
+        let mut groups = Vec::new();
+        let mut offset = 0;
+        for tree in trees {
+            for group in &tree.groups {
+                groups.push(index::Candidates {
+                    directory: &group.destination,
+                    offset: offset + group.files.start,
+                    entries: &tree.files[group.files.clone()],
+                });
             }
+            offset += tree.files.len();
         }
-        Ok(result)
-    }
-
-    /// Check shared destination ancestors once before any comparison or write.
-    fn validate_parents(
-        trees: &[Tree],
-        destinations: &HashSet<String>,
-        state: &State,
-    ) -> Result<()> {
-        let mut existing = Vec::new();
-        let mut inspected = HashSet::new();
-        let paths: HashSet<_> = trees
-            .iter()
-            .flat_map(|tree| {
-                tree.files
-                    .iter()
-                    .filter_map(|entry| entry.destination.parent())
-                    .chain(tree.directories.iter().map(PathBuf::as_path))
-            })
-            .collect();
-        for path in paths {
-            let mut parent = Some(path);
-            while let Some(path) = parent {
-                let key = Paths::key(path);
-                if destinations.contains(&key) {
-                    bail!(
-                        "Destination file conflicts with another mapping's directory: {}",
-                        path.display()
-                    );
-                }
-                if !inspected.insert(key) {
-                    break;
-                }
-                if let Some(metadata) =
-                    Paths::leaf(path).context("Failed to inspect destination ancestor")?
-                {
-                    if !metadata.is_dir() {
-                        bail!(
-                            "Destination ancestor is not a directory: {}",
-                            path.display()
-                        );
-                    }
-                    existing.push(path.to_path_buf());
-                }
-                parent = path.parent();
-            }
-        }
-        state
-            .remember_parents(existing)
-            .context("Failed to retain validated destination directories")
+        index::DirectoryIndex::build(groups, files).context("Failed to build destination index")
     }
 
     /// Canonicalize existing parents and protect all sources from destination writes.
@@ -245,6 +157,7 @@ impl Plan {
     fn scan(job: &CopyJob, index: usize, state: &State) -> Result<Tree> {
         let filter = Filter::new(&job.options).context("Failed to build source filters")?;
         let mut tree = Tree {
+            groups: Vec::new(),
             files: Vec::new(),
             directories: vec![job.destination.clone()],
             present: HashSet::from([String::new()]),
@@ -257,14 +170,28 @@ impl Plan {
                 .map(|path| Self::scan_directory(job, index, path, &filter, state))
                 .collect::<Result<_>>()
                 .context("Failed to scan source directory frontier")?;
-            pending.clear();
-            for (part, children) in results {
+            let mut next = Vec::new();
+            for ((part, children), directory) in results.into_iter().zip(&pending) {
+                let relative = directory
+                    .strip_prefix(&job.source)
+                    .context("Failed to resolve group directory")?;
+                let destination = if relative.as_os_str().is_empty() {
+                    job.destination.clone()
+                } else {
+                    job.destination.join(relative)
+                };
+                let start = tree.files.len();
+                tree.groups.push(Group {
+                    destination,
+                    files: start..start + part.files.len(),
+                });
                 tree.files.extend(part.files);
                 tree.directories.extend(part.directories);
                 tree.present.extend(part.present);
                 tree.links.extend(part.links);
-                pending.extend(children);
+                next.extend(children);
             }
+            pending = next;
         }
         Ok(tree)
     }
@@ -278,13 +205,15 @@ impl Plan {
         state: &State,
     ) -> Result<(Tree, Vec<PathBuf>)> {
         let mut tree = Tree {
+            groups: Vec::new(),
             files: Vec::new(),
             directories: Vec::new(),
             present: HashSet::new(),
             links: Vec::new(),
         };
+        let mut scanner = Scanner::new(job, index, directory, filter, state)?;
         let mut children = Vec::new();
-        for entry in fs::read_dir(directory)
+        for entry in crate::filesystem::Directory::read(directory)
             .with_context(|| format!("Failed to open source directory {}", directory.display()))?
         {
             state
@@ -292,58 +221,11 @@ impl Plan {
                 .check()
                 .context("Failed to continue source scan")?;
             let entry = entry.context("Failed to enumerate source entry")?;
-            if let Some(child) = Self::source_entry(job, index, entry, filter, state, &mut tree)? {
+            if let Some(child) = scanner.entry(entry, &mut tree)? {
                 children.push(child);
             }
         }
         Ok((tree, children))
-    }
-
-    /// Classify cached metadata without following reparse points or excluded directories.
-    fn source_entry(
-        job: &CopyJob,
-        index: usize,
-        entry: fs::DirEntry,
-        filter: &Filter,
-        state: &State,
-        tree: &mut Tree,
-    ) -> Result<Option<PathBuf>> {
-        let path = entry.path();
-        let relative = path
-            .strip_prefix(&job.source)
-            .context("Failed to resolve relative source path")?;
-        let metadata = entry
-            .metadata()
-            .with_context(|| format!("Failed to inspect source entry {}", path.display()))?;
-        if Paths::is_link(&metadata) {
-            tree.links.push(relative.to_path_buf());
-            state.update(|p| p.skipped_links += 1)?;
-        } else if metadata.is_dir() {
-            if !filter.directory(relative) {
-                return Ok(None);
-            }
-            if job.options.purge {
-                tree.present.insert(Paths::key(relative));
-            }
-            if job.options.recursive {
-                tree.directories.push(job.destination.join(relative));
-                return Ok(Some(path));
-            }
-        } else if metadata.is_file() && filter.file(relative) {
-            if job.options.purge {
-                tree.present.insert(Paths::key(relative));
-            }
-            let destination = job.destination.join(relative);
-            tree.files.push(Entry {
-                source: path,
-                destination,
-                job: index,
-                source_metadata: metadata,
-                destination_metadata: None,
-            });
-            state.scanned.fetch_add(1, Ordering::Relaxed);
-        }
-        Ok(None)
     }
 
     /// Plan only selected extras while protecting ignored paths and nested mappings.
@@ -407,5 +289,104 @@ impl Plan {
             }
         }
         Ok(result)
+    }
+}
+
+struct Scanner<'a> {
+    job: &'a CopyJob,
+    index: usize,
+    filter: &'a Filter,
+    state: &'a State,
+    directory: Arc<crate::entry::Directory>,
+    scanned: crate::state::ScanCounter<'a>,
+}
+
+impl<'a> Scanner<'a> {
+    /// Share immutable directory prefixes and retain a local progress counter.
+    fn new(
+        job: &'a CopyJob,
+        index: usize,
+        directory: &Path,
+        filter: &'a Filter,
+        state: &'a State,
+    ) -> Result<Self> {
+        let relative = directory
+            .strip_prefix(&job.source)
+            .context("Failed to resolve source directory")?;
+        let destination = if relative.as_os_str().is_empty() {
+            job.destination.clone()
+        } else {
+            job.destination.join(relative)
+        };
+        Ok(Self {
+            job,
+            index,
+            filter,
+            state,
+            directory: Arc::new(crate::entry::Directory {
+                source: directory.into(),
+                destination,
+            }),
+            scanned: state.scan_counter(),
+        })
+    }
+    /// Classify cached metadata without following reparse points or ignored directories.
+    fn entry(
+        &mut self,
+        entry: crate::filesystem::Entry,
+        tree: &mut Tree,
+    ) -> Result<Option<PathBuf>> {
+        let crate::filesystem::Entry { name, metadata } = entry;
+        if metadata.is_file() && !metadata.is_link() && !self.job.options.purge {
+            if let Some(selected) = self.filter.file_name(&name) {
+                if selected {
+                    tree.files.push(Entry::deferred(
+                        Arc::clone(&self.directory),
+                        name,
+                        self.index,
+                        metadata,
+                    ));
+                    self.scanned.increment();
+                }
+                return Ok(None);
+            }
+        }
+        self.relative_entry(self.directory.source.join(&name), metadata, tree)
+    }
+
+    /// Resolve relative names only when filters or purge require full paths.
+    fn relative_entry(
+        &mut self,
+        path: PathBuf,
+        metadata: crate::filesystem::Snapshot,
+        tree: &mut Tree,
+    ) -> Result<Option<PathBuf>> {
+        let relative = path
+            .strip_prefix(&self.job.source)
+            .context("Failed to resolve relative source path")?;
+        if metadata.is_link() {
+            tree.links.push(relative.to_path_buf());
+            self.state.update(|p| p.skipped_links += 1)?;
+        } else if metadata.is_dir() {
+            if !self.filter.directory(relative) {
+                return Ok(None);
+            }
+            if self.job.options.purge {
+                tree.present.insert(Paths::key(relative));
+            }
+            if self.job.options.recursive {
+                tree.directories.push(self.job.destination.join(relative));
+                return Ok(Some(path));
+            }
+        } else if metadata.is_file() && self.filter.file(relative) {
+            if self.job.options.purge {
+                tree.present.insert(Paths::key(relative));
+            }
+            let destination = self.job.destination.join(relative);
+            tree.files
+                .push(Entry::known(path, destination, self.index, metadata, None));
+            self.scanned.increment();
+        }
+        Ok(None)
     }
 }
