@@ -368,10 +368,11 @@ fn empty_directories_are_preserved() -> Result<()> {
     Ok(())
 }
 
-/// Cancellation during a transfer keeps the old destination and cleans staging files.
+/// Cancellation before an atomic transfer preserves the original destination.
 #[test]
 fn cancelled_transfer_keeps_original_file() -> Result<()> {
-    let fixture = Fixture::new()?;
+    let mut fixture = Fixture::new()?;
+    fixture.job.options.atomic = true;
     Fixture::put(&fixture.job.source, "file", &vec![1u8; 1024 * 1024])?;
     Fixture::put(&fixture.job.destination, "file", b"original")?;
     let entry = crate::plan::Entry {
@@ -404,5 +405,22 @@ fn links_do_not_escape_roots() -> Result<()> {
     std::os::unix::fs::symlink(&external, fixture.job.destination.join("nested"))?;
     ensure!(!fixture.run()?.success());
     ensure!(fs::read(external.join("file"))? == b"retain");
+    Ok(())
+}
+
+/// Direct and atomic modes copy, truncate, and preserve timestamps consistently.
+#[test]
+fn transfer_modes_replace_longer_destinations() -> Result<()> {
+    for atomic in [false, true] {
+        let mut fixture = Fixture::new()?;
+        fixture.job.options.atomic = atomic;
+        Fixture::put(&fixture.job.source, "file", b"new")?;
+        Fixture::put(&fixture.job.destination, "file", b"long original contents")?;
+        Fixture::time(&fixture.job.source.join("file"), 12345)?;
+        ensure!(fixture.run()?.success());
+        ensure!(fs::read(fixture.job.destination.join("file"))? == b"new");
+        ensure!(fixture.run()?.progress.skipped_mtime == 1);
+        ensure!(fs::read_dir(&fixture.job.destination)?.count() == 1);
+    }
     Ok(())
 }

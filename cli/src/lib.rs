@@ -48,6 +48,12 @@ pub struct Cli {
     /// Leave newly copied files with their write time instead of source mtime.
     #[arg(long)]
     no_preserve_mtime: bool,
+    /// Stage each file and atomically replace its destination after successful validation.
+    #[arg(long, conflicts_with = "no_atomic")]
+    atomic: bool,
+    /// Write directly to destinations (the default); overrides TOML atomic mode.
+    #[arg(long)]
+    no_atomic: bool,
     /// Match filter patterns case-sensitively, including on Windows.
     #[arg(long)]
     case_sensitive: bool,
@@ -63,7 +69,7 @@ pub struct Cli {
     /// Bound concurrent complete-content comparisons (default 4).
     #[arg(long)]
     hash_workers: Option<usize>,
-    /// Bound concurrent atomic copies; zero selects up to 32 available CPUs (default).
+    /// Bound concurrent copies; zero selects up to 32 available CPUs (default).
     #[arg(long)]
     copy_workers: Option<usize>,
     /// Retry each failed copy this many times (default 2).

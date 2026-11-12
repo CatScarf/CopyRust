@@ -21,6 +21,7 @@ struct Job {
     hash_algorithm: Option<HashAlgorithm>,
     recursive: Option<bool>,
     preserve_mtime: Option<bool>,
+    atomic: Option<bool>,
     purge: Option<bool>,
     case_sensitive: Option<bool>,
     #[serde(default)]
@@ -45,6 +46,9 @@ impl Job {
         }
         if let Some(value) = self.preserve_mtime {
             options.preserve_mtime = value;
+        }
+        if let Some(value) = self.atomic {
+            options.atomic = value;
         }
         if let Some(value) = self.purge {
             options.purge = value;
@@ -140,6 +144,12 @@ impl Configuration {
         if cli.no_preserve_mtime {
             options.preserve_mtime = false;
         }
+        if cli.atomic {
+            options.atomic = true;
+        }
+        if cli.no_atomic {
+            options.atomic = false;
+        }
         options.purge |= cli.purge;
         options.case_sensitive |= cli.case_sensitive;
         options.exclude_dirs.extend(cli.exclude_dir.clone());
@@ -193,6 +203,26 @@ mod tests {
             jobs.len() == 2 && jobs.iter().all(|job| job.options.compare == Compare::Hash)
         );
         anyhow::ensure!(jobs[1].destination == PathBuf::from("d"));
+        Ok(())
+    }
+
+    /// Atomic copying is opt-in and conflicting explicit flags are rejected.
+    #[test]
+    fn direct_copy_is_default_and_atomic_is_explicit() -> Result<()> {
+        for (flag, expected) in [
+            (None, false),
+            (Some("--atomic"), true),
+            (Some("--no-atomic"), false),
+        ] {
+            let mut args = vec!["copyrust", "--pair", "a", "b"];
+            args.extend(flag);
+            let (jobs, _) = Configuration::load(&Cli::try_parse_from(args)?)?;
+            anyhow::ensure!(jobs[0].options.atomic == expected);
+        }
+        anyhow::ensure!(
+            Cli::try_parse_from(["copyrust", "--pair", "a", "b", "--atomic", "--no-atomic"])
+                .is_err()
+        );
         Ok(())
     }
 

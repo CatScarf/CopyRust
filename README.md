@@ -110,9 +110,13 @@ anyhow::ensure!(summary.success(), "Copy failed: {:?}", summary.errors);
 
 ## Boundaries
 
-All mappings are scanned and compared before writes begin. Each file is copied to
-a sibling temporary file, checked for observed source size/mtime changes, then
-replaced. Modification times and basic permission bits are preserved by default.
+All mappings are scanned and compared before writes begin. Direct writes are the
+default fast mode; a failure or cancellation can leave an overwritten, partial, or
+missing destination file. Use `--atomic` (TOML/Python `atomic = true`) to stage each
+file in a sibling temporary file and replace it only after successful validation.
+`--no-atomic` overrides a configured atomic mode. Both modes check for observed
+source size/mtime changes. Modification times and basic permission bits are preserved
+by default.
 This is not a filesystem snapshot: writers must not modify inputs concurrently,
 especially while deliberately preserving their size and timestamps.
 

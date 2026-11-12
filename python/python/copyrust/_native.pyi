@@ -10,6 +10,7 @@ class CopyOptions:
         hash_algorithm: Literal["xxh3", "xxh64", "blake3"] = "xxh3",
         recursive: bool = True,
         preserve_mtime: bool = True,
+        atomic: bool = False,
         purge: bool = False,
         case_sensitive: bool | None = None,
         exclude_dirs: list[str] = ...,

@@ -263,7 +263,7 @@ impl Content {
         Ok(true)
     }
 
-    /// Copy into a sibling temporary file and replace the destination only after success.
+    /// Copy directly by default or stage each file before atomic replacement.
     pub(crate) fn copy(
         entry: &plan::Entry,
         options: &CopyOptions,
@@ -280,27 +280,66 @@ impl Content {
             .context("Destination has no parent")?;
         state.parent(parent, true)?;
         Paths::leaf(&entry.destination)?;
-        let temporary = tempfile::NamedTempFile::new_in(parent)
-            .context("Failed to create temporary destination")?
-            .into_temp_path();
-        Self::transfer(&entry.source, &temporary, before.len(), state)
+        state
+            .cancellation
+            .check()
+            .context("Failed to begin file transfer")?;
+        let temporary = if options.atomic {
+            Some(
+                tempfile::NamedTempFile::new_in(parent)
+                    .context("Failed to create temporary destination")?
+                    .into_temp_path(),
+            )
+        } else {
+            None
+        };
+        let output = temporary.as_deref().unwrap_or(&entry.destination);
+        #[cfg(unix)]
+        if !options.atomic {
+            use std::os::unix::fs::PermissionsExt;
+            if let Some(metadata) = &entry.destination_metadata {
+                if metadata.permissions().readonly() {
+                    let mode = metadata.permissions().mode() | 0o200;
+                    fs::set_permissions(output, fs::Permissions::from_mode(mode))
+                        .context("Failed to make direct destination writable")?;
+                }
+            }
+        }
+        #[cfg(windows)]
+        if !options.atomic {
+            crate::windows::NativeCopy::make_writable(output)?;
+        }
+        Self::transfer(&entry.source, output, before.len(), state)
             .context("Failed to transfer file contents")?;
-        Self::unchanged(&entry.source, &before).context("Failed to validate copied source")?;
+        Self::finish(entry, options, &before, temporary)
+    }
+
+    /// Validate completed transfers, preserve metadata, and commit optional staging files.
+    fn finish(
+        entry: &plan::Entry,
+        options: &CopyOptions,
+        before: &Metadata,
+        temporary: Option<tempfile::TempPath>,
+    ) -> Result<()> {
+        let output = temporary.as_deref().unwrap_or(&entry.destination);
+        Self::unchanged(&entry.source, before).context("Failed to validate copied source")?;
         #[cfg(not(windows))]
         if options.preserve_mtime {
             filetime::set_file_mtime(
-                &temporary,
-                filetime::FileTime::from_last_modification_time(&before),
+                output,
+                filetime::FileTime::from_last_modification_time(before),
             )
             .context("Failed to preserve modification time")?;
         }
         #[cfg(windows)]
         if !options.preserve_mtime {
-            filetime::set_file_mtime(&temporary, filetime::FileTime::now())
+            filetime::set_file_mtime(output, filetime::FileTime::now())
                 .context("Failed to set copied file write time")?;
         }
         Paths::leaf(&entry.destination)?;
-        Paths::replace(temporary, &entry.destination)?;
+        if let Some(temporary) = temporary {
+            Paths::replace(temporary, &entry.destination)?;
+        }
         #[cfg(windows)]
         if before.permissions().readonly() {
             fs::set_permissions(&entry.destination, before.permissions())
@@ -325,8 +364,9 @@ impl Content {
         let mut output = fs::OpenOptions::new()
             .write(true)
             .truncate(true)
+            .create(true)
             .open(destination)
-            .context("Failed to open temporary destination")?;
+            .context("Failed to open copy destination")?;
         let mut buffer = vec![0u8; size.clamp(1, 512 * 1024) as usize];
         loop {
             state

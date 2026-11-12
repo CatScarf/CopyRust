@@ -56,7 +56,7 @@ impl NativeCopy {
     }
 
     /// Keep temporary outputs removable even when the source is read-only.
-    fn make_writable(path: &Path) -> Result<()> {
+    pub(crate) fn make_writable(path: &Path) -> Result<()> {
         let metadata = match fs::metadata(path) {
             Ok(value) => value,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),

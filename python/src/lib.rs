@@ -12,13 +12,14 @@ struct Options {
 impl Options {
     /// Configure file selection, comparison, and optional destination cleanup.
     #[new]
-    #[pyo3(signature = (*, compare="mtime", hash_algorithm="xxh3", recursive=true, preserve_mtime=true, purge=false, case_sensitive=None, exclude_dirs=Vec::new(), exclude_files=Vec::new(), include_files=Vec::new()))]
+    #[pyo3(signature = (*, compare="mtime", hash_algorithm="xxh3", recursive=true, preserve_mtime=true, atomic=false, purge=false, case_sensitive=None, exclude_dirs=Vec::new(), exclude_files=Vec::new(), include_files=Vec::new()))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         compare: &str,
         hash_algorithm: &str,
         recursive: bool,
         preserve_mtime: bool,
+        atomic: bool,
         purge: bool,
         case_sensitive: Option<bool>,
         exclude_dirs: Vec<String>,
@@ -51,6 +52,7 @@ impl Options {
                 },
                 recursive,
                 preserve_mtime,
+                atomic,
                 purge,
                 case_sensitive: case_sensitive.unwrap_or(!cfg!(windows)),
                 exclude_dirs,
