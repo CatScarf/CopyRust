@@ -21,7 +21,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: copyrust-${{ github.ref }}
+  group: copyrust-${{ github.ref }}-${{ inputs.publish_rust && 'rust' || inputs.artifact_run_id != '' && 'python' || 'build' }}
   cancel-in-progress: true
 
 jobs:
