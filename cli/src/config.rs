@@ -1,6 +1,6 @@
 use super::Cli;
 use anyhow::{Context, Result, bail};
-use copyrust::{Compare, CopyJob, CopyOptions, RunOptions};
+use copyrust::{Compare, CopyJob, CopyOptions, HashAlgorithm, RunOptions};
 use serde::Deserialize;
 use std::{fs, path::PathBuf};
 
@@ -18,6 +18,7 @@ struct Job {
     source: PathBuf,
     destination: PathBuf,
     compare: Option<Compare>,
+    hash_algorithm: Option<HashAlgorithm>,
     recursive: Option<bool>,
     preserve_mtime: Option<bool>,
     purge: Option<bool>,
@@ -35,6 +36,9 @@ impl Job {
         let mut options = defaults.clone();
         if let Some(value) = self.compare {
             options.compare = value;
+        }
+        if let Some(value) = self.hash_algorithm {
+            options.hash_algorithm = value;
         }
         if let Some(value) = self.recursive {
             options.recursive = value;
@@ -107,6 +111,14 @@ impl Configuration {
 
     /// Give explicit command-line selection precedence over TOML options.
     fn overrides(options: &mut CopyOptions, cli: &Cli) -> Result<()> {
+        if let Some(algorithm) = &cli.hash_algorithm {
+            options.hash_algorithm = match algorithm.as_str() {
+                "xxh3" => HashAlgorithm::Xxh3,
+                "xxh64" => HashAlgorithm::Xxh64,
+                "blake3" => HashAlgorithm::Blake3,
+                _ => bail!("Unknown hash algorithm: {algorithm}"),
+            };
+        }
         if let Some(compare) = &cli.compare {
             options.compare = match compare.as_str() {
                 "mtime" => Compare::Mtime,

@@ -1,4 +1,4 @@
-use copyrust::{Cancellation, Compare, CopyEngine};
+use copyrust::{Cancellation, Compare, CopyEngine, HashAlgorithm};
 use pyo3::{exceptions::PyRuntimeError, prelude::*};
 use std::path::PathBuf;
 
@@ -12,10 +12,11 @@ struct Options {
 impl Options {
     /// Configure file selection, comparison, and optional destination cleanup.
     #[new]
-    #[pyo3(signature = (*, compare="mtime", recursive=true, preserve_mtime=true, purge=false, case_sensitive=None, exclude_dirs=Vec::new(), exclude_files=Vec::new(), include_files=Vec::new()))]
+    #[pyo3(signature = (*, compare="mtime", hash_algorithm="xxh3", recursive=true, preserve_mtime=true, purge=false, case_sensitive=None, exclude_dirs=Vec::new(), exclude_files=Vec::new(), include_files=Vec::new()))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         compare: &str,
+        hash_algorithm: &str,
         recursive: bool,
         preserve_mtime: bool,
         purge: bool,
@@ -38,6 +39,16 @@ impl Options {
         Ok(Self {
             value: copyrust::CopyOptions {
                 compare,
+                hash_algorithm: match hash_algorithm {
+                    "xxh3" => HashAlgorithm::Xxh3,
+                    "xxh64" => HashAlgorithm::Xxh64,
+                    "blake3" => HashAlgorithm::Blake3,
+                    _ => {
+                        return Err(pyo3::exceptions::PyValueError::new_err(
+                            "hash_algorithm must be xxh3, xxh64, or blake3",
+                        ));
+                    }
+                },
                 recursive,
                 preserve_mtime,
                 purge,
@@ -96,7 +107,7 @@ struct RunOptions {
 impl RunOptions {
     /// Bound batch-wide worker pools and configure retries and preview mode.
     #[new]
-    #[pyo3(signature = (*, scan_workers=8, hash_workers=4, copy_workers=4, retries=2, progress_interval_ms=250, dry_run=false))]
+    #[pyo3(signature = (*, scan_workers=8, hash_workers=4, copy_workers=0, retries=2, progress_interval_ms=250, dry_run=false))]
     fn new(
         scan_workers: usize,
         hash_workers: usize,

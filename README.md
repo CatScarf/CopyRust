@@ -2,7 +2,7 @@
 
 Parallel, content-aware batch copying for Rust, Python, and the command line.
 Copy directory **contents** into explicit destinations, skip unchanged files by
-mtime or full BLAKE3 digest, and observe separate scan, hash, and copy counters.
+mtime or full content hash, and observe separate scan, hash, and copy counters.
 
 ```console
 cargo install copyrust-cli
@@ -20,7 +20,7 @@ copyrust --config copy.toml --dry-run --progress json
 | Mode | Skip condition for existing regular files |
 | --- | --- |
 | `mtime` (default) | Equal size and exact modification time |
-| `hash` | Equal size and equal complete BLAKE3 content digest; timestamps never bypass hashing |
+| `hash` | Equal size and equal complete content digest; timestamps never bypass hashing |
 | `auto` | Equal size and mtime, otherwise equal full digest |
 | `always` | Never skip distinct files |
 
@@ -28,9 +28,15 @@ Different sizes copy without hashing. Identical file identities are always skipp
 `auto` and `mtime` cannot detect equal-size content changes with preserved timestamps.
 There is no persistent digest cache in version 0.1.
 
+`--hash-algorithm xxh3` selects XXH3-64 with runtime SIMD dispatch (the default).
+`xxh64` selects traditional seed-zero XXH64; `blake3` selects a cryptographic
+256-bit digest. xxHash modes prioritize non-adversarial artifact comparison and
+have 64-bit collision limits. No mode samples file contents.
+
 ```toml
 [defaults]
 compare = "hash"
+hash_algorithm = "xxh3"
 exclude_dirs = ["Intermediate", "Saved", "DerivedDataCache"]
 exclude_files = ["*.tmp", "*.log"]
 
@@ -121,7 +127,8 @@ It is not a transactional operation across the entire batch.
 
 Version 0.1 targets regular build artifacts. ACLs, ownership, alternate data streams,
 sparse layout, extended attributes, resumable transfers, and network snapshot
-consistency are not replicated. Hash comparison must read equal-size candidates
+consistency are not replicated. Source files and destination directory topology
+must remain stable during a batch. Hash comparison must read equal-size candidates
 on both sides; performance depends on workload, storage, and filesystem cache.
 
 ## Development

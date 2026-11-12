@@ -1,9 +1,5 @@
-use crate::{
-    CopyJob, Progress, RunOptions, Summary,
-    io::{Content, Paths},
-    plan::{Entry, Plan},
-    state::{Cancellation, State},
-};
+use crate::{CopyJob, Progress, RunOptions, Summary};
+use crate::{io, plan, state};
 use anyhow::{Context, Result, bail};
 use rayon::prelude::*;
 use std::{
@@ -21,11 +17,11 @@ impl CopyEngine {
     pub fn run(
         jobs: &[CopyJob],
         options: &RunOptions,
-        cancellation: Cancellation,
+        cancellation: state::Cancellation,
         on_progress: impl Fn(&Progress) -> Result<()> + Sync,
     ) -> Result<Summary> {
         Self::validate(options)?;
-        let state = State::new(options, cancellation);
+        let state = state::State::new(options, cancellation);
         let done = AtomicBool::new(false);
         let result = thread::scope(|scope| -> Result<()> {
             let reporter = scope.spawn(|| Self::report(&state, options, &done, &on_progress));
@@ -54,14 +50,13 @@ impl CopyEngine {
 
     /// Reject unreasonable concurrency and progress settings before spawning threads.
     fn validate(options: &RunOptions) -> Result<()> {
-        for count in [
-            options.scan_workers,
-            options.hash_workers,
-            options.copy_workers,
-        ] {
+        for count in [options.scan_workers, options.hash_workers] {
             if !(1..=256).contains(&count) {
                 bail!("Worker counts must be between 1 and 256");
             }
+        }
+        if options.copy_workers > 256 {
+            bail!("Copy workers must be zero (automatic) or at most 256");
         }
         if options.progress_interval_ms == 0 || options.retries > 100 {
             bail!("Progress interval must be positive and retries at most 100");
@@ -71,7 +66,7 @@ impl CopyEngine {
 
     /// Emit bounded-frequency snapshots from one thread and propagate callback errors.
     fn report(
-        state: &State,
+        state: &state::State,
         options: &RunOptions,
         done: &AtomicBool,
         callback: &(impl Fn(&Progress) -> Result<()> + Sync),
@@ -87,8 +82,8 @@ impl CopyEngine {
     }
 
     /// Complete planning and comparison before any writes, then purge only on success.
-    fn execute(jobs: &[CopyJob], options: &RunOptions, state: &State) -> Result<()> {
-        let plan = Plan::build(jobs, options.scan_workers, state)?;
+    fn execute(jobs: &[CopyJob], options: &RunOptions, state: &state::State) -> Result<()> {
+        let plan = plan::Plan::build(jobs, options.scan_workers, state)?;
         let selections = Self::compare(&plan, options, state)?;
         let selected: Vec<_> = plan
             .files
@@ -98,12 +93,8 @@ impl CopyEngine {
             .collect();
         let bytes = selected
             .iter()
-            .try_fold(0u64, |total, entry| -> Result<u64> {
-                Ok(total
-                    + fs::metadata(&entry.source)
-                        .context("Failed to count selected copy bytes")?
-                        .len())
-            })?;
+            .map(|entry| entry.source_metadata.len())
+            .sum();
         state.update(|p| {
             p.phase = "copying".into();
             p.total_copy_bytes = Some(bytes);
@@ -112,6 +103,15 @@ impl CopyEngine {
         })?;
         if options.dry_run {
             return Ok(());
+        }
+        for directory in &plan.directories {
+            state
+                .cancellation
+                .check()
+                .context("Cancelled before directory creation")?;
+            state
+                .parent(directory, true)
+                .context("Failed to prepare selected directory")?;
         }
         Self::copy_selected(&selected, &plan, options, state)?;
         state
@@ -125,11 +125,33 @@ impl CopyEngine {
     }
 
     /// Compare selected files in bounded parallel workers without mutating outputs.
-    fn compare(plan: &Plan, options: &RunOptions, state: &State) -> Result<Vec<bool>> {
+    fn compare(plan: &plan::Plan, options: &RunOptions, state: &state::State) -> Result<Vec<bool>> {
         state.update(|p| {
             p.phase = "comparing".into();
             p.total_files = Some(plan.files.len() as u64);
         })?;
+        if plan.files.is_empty() {
+            return Ok(Vec::new());
+        }
+        if plan
+            .jobs
+            .iter()
+            .all(|job| job.options.compare == crate::Compare::Mtime)
+        {
+            return plan
+                .files
+                .iter()
+                .map(|entry| {
+                    let result =
+                        io::Content::needs_copy(entry, &plan.jobs[entry.job].options, state)
+                            .with_context(|| {
+                                format!("Failed to compare {}", entry.source.display())
+                            });
+                    state.update(|progress| progress.compared_files += 1)?;
+                    result
+                })
+                .collect();
+        }
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(options.hash_workers)
             .build()
@@ -138,8 +160,11 @@ impl CopyEngine {
             plan.files
                 .par_iter()
                 .map(|entry| {
-                    let result = Content::needs_copy(entry, &plan.jobs[entry.job].options, state)
-                        .with_context(|| format!("Failed to compare {}", entry.source.display()));
+                    let result =
+                        io::Content::needs_copy(entry, &plan.jobs[entry.job].options, state)
+                            .with_context(|| {
+                                format!("Failed to compare {}", entry.source.display())
+                            });
                     state.update(|p| p.compared_files += 1)?;
                     result
                 })
@@ -150,19 +175,33 @@ impl CopyEngine {
 
     /// Copy planned differences using the batch-wide copy worker limit.
     fn copy_selected(
-        selected: &[&Entry],
-        plan: &Plan,
+        selected: &[&plan::Entry],
+        plan: &plan::Plan,
         options: &RunOptions,
-        state: &State,
+        state: &state::State,
     ) -> Result<()> {
+        if selected.is_empty() {
+            return Ok(());
+        }
         let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(options.copy_workers)
+            .num_threads(
+                (if options.copy_workers == 0 {
+                    thread::available_parallelism()
+                        .map(|count| count.get())
+                        .unwrap_or(4)
+                        .min(32)
+                } else {
+                    options.copy_workers
+                })
+                .min(selected.len())
+                .max(1),
+            )
             .build()
             .context("Failed to start copy workers")?;
         pool.install(|| {
             selected.par_iter().try_for_each(|entry| {
                 match Self::retry(options.retries, state, || {
-                    Content::copy(entry, &plan.jobs[entry.job].options, state)
+                    io::Content::copy(entry, &plan.jobs[entry.job].options, state)
                 }) {
                     Ok(()) => state.update(|p| p.copied_files += 1),
                     Err(error) => state.failure(
@@ -175,7 +214,7 @@ impl CopyEngine {
     }
 
     /// Retry a failed file operation while preserving the last contextual error.
-    fn retry(attempts: usize, state: &State, action: impl Fn() -> Result<()>) -> Result<()> {
+    fn retry(attempts: usize, state: &state::State, action: impl Fn() -> Result<()>) -> Result<()> {
         for attempt in 0..=attempts {
             state
                 .cancellation
@@ -193,14 +232,14 @@ impl CopyEngine {
     }
 
     /// Delete planned extras after successful copying without following links.
-    fn purge(plan: &Plan, state: &State) -> Result<()> {
+    fn purge(plan: &plan::Plan, state: &state::State) -> Result<()> {
         state.update(|p| p.phase = "deleting".into())?;
         for removal in &plan.removals {
             state
                 .cancellation
                 .check()
                 .context("Failed to continue cleanup")?;
-            Paths::guard(&removal.path)?;
+            io::Paths::guard(&removal.path)?;
             if removal.directory {
                 if fs::read_dir(&removal.path)
                     .context("Failed to inspect extra directory")?

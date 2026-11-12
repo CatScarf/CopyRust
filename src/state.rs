@@ -1,12 +1,12 @@
 use crate::{Progress, RunOptions};
 use anyhow::{Context, Result, bail};
-use std::{
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
-    },
-    time::Instant,
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
+use std::time::Instant;
 
 /// Cooperatively stop scanning, hashing, and copying without truncating destinations.
 #[derive(Clone, Default)]
@@ -38,6 +38,7 @@ pub(crate) struct State {
     pub copied: AtomicU64,
     pub errors: Mutex<Vec<String>>,
     pub cancellation: Cancellation,
+    parents: Mutex<HashSet<PathBuf>>,
     started: Instant,
 }
 
@@ -54,8 +55,27 @@ impl State {
             copied: AtomicU64::new(0),
             errors: Mutex::new(Vec::new()),
             cancellation,
+            parents: Mutex::new(HashSet::new()),
             started: Instant::now(),
         }
+    }
+
+    /// Validate shared directory topology once per batch and create missing copy parents.
+    pub(crate) fn parent(&self, path: &Path, create: bool) -> Result<()> {
+        let mut parents = self
+            .parents
+            .lock()
+            .map_err(|error| anyhow::anyhow!("Failed to lock validated directories: {error}"))?;
+        if parents.contains(path) {
+            return Ok(());
+        }
+        crate::io::Paths::guard(path).context("Failed to validate copy parent")?;
+        if create {
+            std::fs::create_dir_all(path).context("Failed to create copy parent")?;
+        }
+        crate::io::Paths::guard(path).context("Failed to validate prepared copy parent")?;
+        parents.insert(path.into());
+        Ok(())
     }
 
     /// Apply one short counter update without exposing synchronization primitives.

@@ -12,11 +12,22 @@ pub enum Compare {
     Always,
 }
 
+/// Select a portable full-content digest for equal-size candidate files.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum HashAlgorithm {
+    #[default]
+    Xxh3,
+    Xxh64,
+    Blake3,
+}
+
 /// Configure one directory tree's selection and comparison behavior.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CopyOptions {
     pub compare: Compare,
+    pub hash_algorithm: HashAlgorithm,
     pub recursive: bool,
     pub preserve_mtime: bool,
     pub purge: bool,
@@ -31,6 +42,7 @@ impl Default for CopyOptions {
     fn default() -> Self {
         Self {
             compare: Compare::Mtime,
+            hash_algorithm: HashAlgorithm::Xxh3,
             recursive: true,
             preserve_mtime: true,
             purge: false,
@@ -81,7 +93,7 @@ impl Default for RunOptions {
         Self {
             scan_workers: 8,
             hash_workers: 4,
-            copy_workers: 4,
+            copy_workers: 0,
             retries: 2,
             progress_interval_ms: 250,
             dry_run: false,

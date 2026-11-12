@@ -2,13 +2,17 @@
 
 mod engine;
 mod filter;
+mod hashing;
 mod io;
 mod model;
 mod plan;
 mod state;
+#[cfg(windows)]
+mod windows;
 
 pub use engine::CopyEngine;
-pub use model::{Compare, CopyJob, CopyOptions, Progress, RunOptions, Summary};
+pub use model::{Compare, HashAlgorithm};
+pub use model::{CopyJob, CopyOptions, Progress, RunOptions, Summary};
 pub use state::Cancellation;
 
 #[cfg(test)]

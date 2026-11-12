@@ -187,7 +187,7 @@ checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 
 [[package]]
 name = "copyrust"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "blake3",
@@ -198,12 +198,14 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "twox-hash",
  "walkdir",
+ "windows-sys",
 ]
 
 [[package]]
 name = "copyrust-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -219,7 +221,7 @@ dependencies = [
 
 [[package]]
 name = "copyrust-python"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "copyrust",
@@ -841,6 +843,12 @@ dependencies = [
  "tracing-core",
  "tracing-log",
 ]
+
+[[package]]
+name = "twox-hash"
+version = "2.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "86a801b3cea342a06d468c8710662aa29e5e05e4f5c0d62f00bbb7f2ad7941c2"
 
 [[package]]
 name = "unicode-ident"

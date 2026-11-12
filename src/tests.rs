@@ -320,6 +320,76 @@ fn failed_batch_never_purges() -> Result<()> {
     Ok(())
 }
 
+/// Every supported digest detects changes and skips timestamp-only rewrites.
+#[test]
+fn digest_algorithms_preserve_copy_semantics() -> Result<()> {
+    for algorithm in [
+        crate::HashAlgorithm::Xxh3,
+        crate::HashAlgorithm::Xxh64,
+        crate::HashAlgorithm::Blake3,
+    ] {
+        let mut fixture = Fixture::new()?;
+        fixture.job.options.compare = Compare::Hash;
+        fixture.job.options.hash_algorithm = algorithm;
+        Fixture::put(&fixture.job.source, "file", b"AAAA")?;
+        Fixture::put(&fixture.job.destination, "file", b"BBBB")?;
+        Fixture::time(&fixture.job.source.join("file"), 100)?;
+        Fixture::time(&fixture.job.destination.join("file"), 100)?;
+        let first = fixture.run()?;
+        ensure!(first.success() && first.progress.copied_files == 1);
+        ensure!(fs::read(fixture.job.destination.join("file"))? == b"AAAA");
+        Fixture::time(&fixture.job.destination.join("file"), 200)?;
+        let second = fixture.run()?;
+        ensure!(second.success() && second.progress.skipped_hash == 1);
+    }
+    Ok(())
+}
+
+/// Successful transfers preserve exact timestamps for the next incremental run.
+#[test]
+fn actual_copies_preserve_timestamps() -> Result<()> {
+    let fixture = Fixture::new()?;
+    Fixture::put(&fixture.job.source, "space 中文/file.bin", b"contents")?;
+    Fixture::time(&fixture.job.source.join("space 中文/file.bin"), 12345)?;
+    ensure!(fixture.run()?.success());
+    let repeated = fixture.run()?;
+    ensure!(repeated.success() && repeated.progress.skipped_mtime == 1);
+    Ok(())
+}
+
+/// Recursive copying retains empty directories and creates an empty destination root.
+#[test]
+fn empty_directories_are_preserved() -> Result<()> {
+    let fixture = Fixture::new()?;
+    fs::create_dir_all(fixture.job.source.join("empty/child"))?;
+    fs::remove_dir(&fixture.job.destination)?;
+    ensure!(fixture.run()?.success());
+    ensure!(fixture.job.destination.join("empty/child").is_dir());
+    Ok(())
+}
+
+/// Cancellation during a transfer keeps the old destination and cleans staging files.
+#[test]
+fn cancelled_transfer_keeps_original_file() -> Result<()> {
+    let fixture = Fixture::new()?;
+    Fixture::put(&fixture.job.source, "file", &vec![1u8; 1024 * 1024])?;
+    Fixture::put(&fixture.job.destination, "file", b"original")?;
+    let entry = crate::plan::Entry {
+        source: fixture.job.source.join("file"),
+        destination: fixture.job.destination.join("file"),
+        job: 0,
+        source_metadata: fs::metadata(fixture.job.source.join("file"))?,
+        destination_metadata: Some(fs::metadata(fixture.job.destination.join("file"))?),
+    };
+    let cancellation = Cancellation::default();
+    cancellation.cancel();
+    let state = crate::state::State::new(&RunOptions::default(), cancellation);
+    ensure!(crate::io::Content::copy(&entry, &fixture.job.options, &state).is_err());
+    ensure!(fs::read(fixture.job.destination.join("file"))? == b"original");
+    ensure!(fs::read_dir(&fixture.job.destination)?.count() == 1);
+    Ok(())
+}
+
 /// Source links are skipped and destination directory links are rejected.
 #[cfg(unix)]
 #[test]

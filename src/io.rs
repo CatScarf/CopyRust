@@ -1,17 +1,32 @@
-use crate::{Compare, CopyOptions, plan::Entry, state::State};
+use crate::{Compare, CopyOptions, HashAlgorithm};
+use crate::{hashing, plan, state};
 use anyhow::{Context, Result, bail};
-use std::{
-    fs::{self, File, Metadata},
-    io::{Read, Write},
-    path::{Component, Path, PathBuf},
-    sync::atomic::Ordering,
-};
+use std::fs::{self, File, Metadata};
+use std::io::Read;
+#[cfg(not(windows))]
+use std::io::Write;
+use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::Ordering;
 
 pub(crate) struct Paths;
 
 impl Paths {
+    /// Inspect a leaf without following links after directory preflight has completed.
+    pub(crate) fn leaf(path: &Path) -> Result<Option<Metadata>> {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if Self::is_link(&metadata) => {
+                bail!("Link traversal is disabled: {}", path.display())
+            }
+            Ok(metadata) => Ok(Some(metadata)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => {
+                Err(error).with_context(|| format!("Failed to inspect file {}", path.display()))
+            }
+        }
+    }
+
     /// Atomically replace existing files and restore read-only flags after a failed move.
-    pub(crate) fn replace(temporary: tempfile::NamedTempFile, destination: &Path) -> Result<()> {
+    pub(crate) fn replace(temporary: tempfile::TempPath, destination: &Path) -> Result<()> {
         #[cfg(windows)]
         let previous = match fs::metadata(destination) {
             Ok(metadata) if metadata.permissions().readonly() => {
@@ -147,13 +162,17 @@ impl Paths {
 pub(crate) struct Content;
 
 impl Content {
-    /// Read a complete BLAKE3 digest while checking cancellation and source stability.
-    fn digest(path: &Path, state: &State) -> Result<blake3::Hash> {
-        let before = fs::metadata(path).context("Failed to inspect hash input")?;
+    /// Read a complete digest while checking cancellation and source stability.
+    fn digest(
+        path: &Path,
+        before: &Metadata,
+        algorithm: HashAlgorithm,
+        state: &state::State,
+    ) -> Result<hashing::Digest> {
         let mut file = File::open(path)
             .with_context(|| format!("Failed to open hash input {}", path.display()))?;
-        let mut hash = blake3::Hasher::new();
-        let mut buffer = vec![0u8; 512 * 1024];
+        let mut hash = hashing::ContentHash::new(algorithm);
+        let mut buffer = vec![0u8; before.len().clamp(1, 512 * 1024) as usize];
         loop {
             state
                 .cancellation
@@ -168,8 +187,8 @@ impl Content {
             hash.update(&buffer[..count]);
             state.hashed.fetch_add(count as u64, Ordering::Relaxed);
         }
-        Self::unchanged(path, &before).context("Hash input changed during comparison")?;
-        Ok(hash.finalize())
+        Self::unchanged(path, before).context("Hash input changed during comparison")?;
+        Ok(hash.finish())
     }
 
     /// Reject observed mutations instead of silently accepting a partial file.
@@ -185,18 +204,20 @@ impl Content {
     }
 
     /// Classify files using size, optional timestamp shortcuts, and strict full digests.
-    pub(crate) fn needs_copy(entry: &Entry, options: &CopyOptions, state: &State) -> Result<bool> {
+    pub(crate) fn needs_copy(
+        entry: &plan::Entry,
+        options: &CopyOptions,
+        state: &state::State,
+    ) -> Result<bool> {
         state
             .cancellation
             .check()
             .context("Failed to continue comparison")?;
-        let source = fs::metadata(&entry.source).context("Failed to inspect copy source")?;
-        let destination = match fs::symlink_metadata(&entry.destination) {
-            Ok(value) => value,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
-            Err(error) => return Err(error).context("Failed to inspect copy destination"),
+        let source = &entry.source_metadata;
+        let Some(destination) = &entry.destination_metadata else {
+            return Ok(true);
         };
-        if Paths::is_link(&destination) {
+        if Paths::is_link(destination) {
             bail!(
                 "Destination link traversal is disabled: {}",
                 entry.destination.display()
@@ -205,13 +226,16 @@ impl Content {
         if !destination.is_file() {
             bail!("Destination is not a file: {}", entry.destination.display());
         }
-        if same_file::is_same_file(&entry.source, &entry.destination)
-            .context("Failed to compare file identities")?
-        {
-            state.update(|p| p.skipped_same_file += 1)?;
-            return Ok(false);
+        if options.compare == Compare::Always {
+            if same_file::is_same_file(&entry.source, &entry.destination)
+                .context("Failed to compare file identities")?
+            {
+                state.update(|p| p.skipped_same_file += 1)?;
+                return Ok(false);
+            }
+            return Ok(true);
         }
-        if options.compare == Compare::Always || source.len() != destination.len() {
+        if source.len() != destination.len() {
             return Ok(true);
         }
         let same_time = source.modified().context("Failed to read source mtime")?
@@ -225,7 +249,14 @@ impl Content {
         if options.compare == Compare::Mtime {
             return Ok(true);
         }
-        if Self::digest(&entry.source, state)? == Self::digest(&entry.destination, state)? {
+        if Self::digest(&entry.source, source, options.hash_algorithm, state)?
+            == Self::digest(
+                &entry.destination,
+                destination,
+                options.hash_algorithm,
+                state,
+            )?
+        {
             state.update(|p| p.skipped_hash += 1)?;
             return Ok(false);
         }
@@ -233,50 +264,88 @@ impl Content {
     }
 
     /// Copy into a sibling temporary file and replace the destination only after success.
-    pub(crate) fn copy(entry: &Entry, options: &CopyOptions, state: &State) -> Result<()> {
-        Paths::guard(&entry.destination)?;
-        Paths::guard(&entry.source)?;
-        let before = fs::metadata(&entry.source).context("Failed to inspect copy input")?;
+    pub(crate) fn copy(
+        entry: &plan::Entry,
+        options: &CopyOptions,
+        state: &state::State,
+    ) -> Result<()> {
+        state.parent(
+            entry.source.parent().context("Source has no parent")?,
+            false,
+        )?;
+        let before = Paths::leaf(&entry.source)?.context("Source disappeared before copying")?;
         let parent = entry
             .destination
             .parent()
             .context("Destination has no parent")?;
-        fs::create_dir_all(parent).context("Failed to create destination parent")?;
-        let mut temporary = tempfile::NamedTempFile::new_in(parent)
-            .context("Failed to create temporary destination")?;
-        let mut source = File::open(&entry.source).context("Failed to open copy source")?;
-        let mut buffer = vec![0u8; 512 * 1024];
-        loop {
-            state
-                .cancellation
-                .check()
-                .context("Failed to continue copy")?;
-            let count = source
-                .read(&mut buffer)
-                .context("Failed to read copy source")?;
-            if count == 0 {
-                break;
-            }
-            temporary
-                .write_all(&buffer[..count])
-                .context("Failed to write temporary destination")?;
-            state.copied.fetch_add(count as u64, Ordering::Relaxed);
-        }
-        temporary
-            .flush()
-            .context("Failed to flush temporary destination")?;
+        state.parent(parent, true)?;
+        Paths::leaf(&entry.destination)?;
+        let temporary = tempfile::NamedTempFile::new_in(parent)
+            .context("Failed to create temporary destination")?
+            .into_temp_path();
+        Self::transfer(&entry.source, &temporary, before.len(), state)
+            .context("Failed to transfer file contents")?;
         Self::unchanged(&entry.source, &before).context("Failed to validate copied source")?;
+        #[cfg(not(windows))]
         if options.preserve_mtime {
             filetime::set_file_mtime(
-                temporary.path(),
+                &temporary,
                 filetime::FileTime::from_last_modification_time(&before),
             )
             .context("Failed to preserve modification time")?;
         }
-        Paths::guard(&entry.destination)?;
+        #[cfg(windows)]
+        if !options.preserve_mtime {
+            filetime::set_file_mtime(&temporary, filetime::FileTime::now())
+                .context("Failed to set copied file write time")?;
+        }
+        Paths::leaf(&entry.destination)?;
         Paths::replace(temporary, &entry.destination)?;
+        #[cfg(windows)]
+        if before.permissions().readonly() {
+            fs::set_permissions(&entry.destination, before.permissions())
+                .context("Failed to preserve source read-only attribute")?;
+        }
+        #[cfg(not(windows))]
         fs::set_permissions(&entry.destination, before.permissions())
             .context("Failed to preserve destination permissions")?;
         Ok(())
+    }
+
+    /// Delegate Windows transfers to the native progress-capable copy engine.
+    #[cfg(windows)]
+    fn transfer(source: &Path, destination: &Path, _size: u64, state: &state::State) -> Result<()> {
+        crate::windows::NativeCopy::run(source, destination, state)
+    }
+
+    /// Stream portable transfers with buffers proportional to small-file sizes.
+    #[cfg(not(windows))]
+    fn transfer(source: &Path, destination: &Path, size: u64, state: &state::State) -> Result<()> {
+        let mut input = File::open(source).context("Failed to open copy source")?;
+        let mut output = fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(destination)
+            .context("Failed to open temporary destination")?;
+        let mut buffer = vec![0u8; size.clamp(1, 512 * 1024) as usize];
+        loop {
+            state
+                .cancellation
+                .check()
+                .context("Failed to continue portable transfer")?;
+            let count = input
+                .read(&mut buffer)
+                .context("Failed to read portable copy source")?;
+            if count == 0 {
+                break;
+            }
+            output
+                .write_all(&buffer[..count])
+                .context("Failed to write portable copy destination")?;
+            state.copied.fetch_add(count as u64, Ordering::Relaxed);
+        }
+        output
+            .flush()
+            .context("Failed to flush portable copy destination")
     }
 }

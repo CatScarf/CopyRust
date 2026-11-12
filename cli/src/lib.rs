@@ -24,6 +24,9 @@ pub struct Cli {
     /// Select timestamp, strict hash, metadata-then-hash, or unconditional copying.
     #[arg(long, value_parser = ["mtime", "hash", "auto", "always"])]
     compare: Option<String>,
+    /// Select XXH3-64 (default), traditional XXH64, or BLAKE3 for content comparison.
+    #[arg(long, value_parser = ["xxh3", "xxh64", "blake3"])]
+    hash_algorithm: Option<String>,
     /// Prune matching directory names or source-relative globs; repeat as needed.
     #[arg(long)]
     exclude_dir: Vec<String>,
@@ -60,7 +63,7 @@ pub struct Cli {
     /// Bound concurrent complete-content comparisons (default 4).
     #[arg(long)]
     hash_workers: Option<usize>,
-    /// Bound concurrent atomic file copies (default 4).
+    /// Bound concurrent atomic copies; zero selects up to 32 available CPUs (default).
     #[arg(long)]
     copy_workers: Option<usize>,
     /// Retry each failed copy this many times (default 2).
