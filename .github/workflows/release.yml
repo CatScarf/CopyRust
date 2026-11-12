@@ -1,0 +1,125 @@
+name: Build and release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            runner: windows-2022
+          - target: aarch64-pc-windows-msvc
+            runner: windows-11-arm
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+          - target: aarch64-apple-darwin
+            runner: macos-15
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '12.0'
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install Rust
+        shell: bash
+        run: rustup update stable --no-self-update && rustup default stable
+      - name: Check and build
+        shell: bash
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+          cargo test --locked --workspace
+          cargo build --locked --release -p copyrust-cli
+      - name: Check Python typing and formatting
+        shell: bash
+        run: |
+          python -m pip install black pyright
+          python -m black --check python/python
+          python -m pyright --project python/pyproject.toml
+      - name: Build Python wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          manylinux: '2_28'
+          args: --release --locked --manifest-path python/Cargo.toml --out temp/wheels
+      - name: Smoke-test installed wheel
+        shell: bash
+        run: |
+          python -m pip install --only-binary=:all: --no-index --find-links temp/wheels copyrust
+          python -m copyrust --version
+          python -c "from pathlib import Path; import tempfile; import copyrust; t=tempfile.TemporaryDirectory(); r=Path(t.name); s=r/'src'; s.mkdir(); (s/'file').write_bytes(b'wheel smoke'); q=copyrust.copy([copyrust.CopyJob(s,r/'dst',options=copyrust.CopyOptions(compare='hash'))]); assert q.success, q.errors; assert (r/'dst'/'file').read_bytes()==b'wheel smoke'"
+      - name: Archive native CLI
+        shell: bash
+        env:
+          COPY_TARGET: ${{ matrix.target }}
+        run: |
+          python -c "import os,pathlib,zipfile; p=pathlib.Path('temp/native'); p.mkdir(parents=True,exist_ok=True); n='copyrust'+('.exe' if os.name=='nt' else ''); z=zipfile.ZipFile(p/('copyrust-'+os.environ['COPY_TARGET']+'.zip'),'w',zipfile.ZIP_DEFLATED); z.write(pathlib.Path('target/release')/n,n); z.close()"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: copyrust-wheel-${{ matrix.target }}
+          path: temp/wheels/*.whl
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: copyrust-bin-${{ matrix.target }}
+          path: temp/native/*.zip
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: copyrust-bin-*
+          path: temp/native
+          merge-multiple: true
+      - name: Publish Rust packages and GitHub binaries
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cargo publish --locked -p copyrust
+          cargo publish --locked -p copyrust-cli
+          gh release create "$GITHUB_REF_NAME" temp/native/*.zip --verify-tag --generate-notes
+
+  pypi:
+    needs: release
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    environment:
+      name: pypi
+      url: https://pypi.org/project/copyrust/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: copyrust-wheel-*
+          path: temp/wheels
+          merge-multiple: true
+      - name: Publish Python wheels
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: temp/wheels

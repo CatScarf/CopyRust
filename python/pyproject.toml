@@ -1,0 +1,33 @@
+[build-system]
+requires = ["maturin>=1.15,<2"]
+build-backend = "maturin"
+
+[project]
+name = "copyrust"
+dynamic = ["version"]
+requires-python = ">=3.9"
+description = "Parallel, content-aware batch file copying with native Rust workers"
+readme = "../README.md"
+license = "MIT"
+classifiers = ["Programming Language :: Python :: 3", "Programming Language :: Rust", "Typing :: Typed"]
+
+[project.urls]
+Repository = "https://github.com/CatScarf/CopyRust"
+
+[project.scripts]
+copyrust = "copyrust:main"
+
+[tool.maturin]
+python-source = "python"
+module-name = "copyrust._native"
+bindings = "pyo3"
+include = ["python/copyrust/**/*.pyi", "python/copyrust/py.typed"]
+
+[tool.pyright]
+include = ["python/copyrust"]
+pythonVersion = "3.9"
+typeCheckingMode = "strict"
+reportMissingModuleSource = false
+
+[tool.black]
+target-version = ["py39"]

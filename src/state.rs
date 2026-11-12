@@ -1,0 +1,102 @@
+use crate::{Progress, RunOptions};
+use anyhow::{Context, Result, bail};
+use std::{
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    time::Instant,
+};
+
+/// Cooperatively stop scanning, hashing, and copying without truncating destinations.
+#[derive(Clone, Default)]
+pub struct Cancellation(Arc<AtomicBool>);
+
+impl Cancellation {
+    /// Request cancellation from another thread or a progress callback.
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+
+    /// Read whether a cancellation request is pending.
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    /// Stop the current operation with a contextual cancellation error.
+    pub(crate) fn check(&self) -> Result<()> {
+        if self.is_cancelled() {
+            bail!("Copy operation was cancelled");
+        }
+        Ok(())
+    }
+}
+
+pub(crate) struct State {
+    pub progress: Mutex<Progress>,
+    pub hashed: AtomicU64,
+    pub copied: AtomicU64,
+    pub errors: Mutex<Vec<String>>,
+    pub cancellation: Cancellation,
+    started: Instant,
+}
+
+impl State {
+    /// Start counters before enumeration so long scans remain observable.
+    pub(crate) fn new(options: &RunOptions, cancellation: Cancellation) -> Self {
+        Self {
+            progress: Mutex::new(Progress {
+                phase: "scanning".into(),
+                dry_run: options.dry_run,
+                ..Progress::default()
+            }),
+            hashed: AtomicU64::new(0),
+            copied: AtomicU64::new(0),
+            errors: Mutex::new(Vec::new()),
+            cancellation,
+            started: Instant::now(),
+        }
+    }
+
+    /// Apply one short counter update without exposing synchronization primitives.
+    pub(crate) fn update(&self, change: impl FnOnce(&mut Progress)) -> Result<()> {
+        let mut progress = self
+            .progress
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Failed to lock progress: {e}"))?;
+        change(&mut progress);
+        Ok(())
+    }
+
+    /// Return a coherent progress snapshot with byte counters and elapsed time.
+    pub(crate) fn snapshot(&self) -> Result<Progress> {
+        let mut progress = self
+            .progress
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Failed to read progress: {e}"))?
+            .clone();
+        progress.elapsed_seconds = self.started.elapsed().as_secs_f64();
+        progress.hashed_bytes = self.hashed.load(Ordering::Relaxed);
+        progress.copied_bytes = self.copied.load(Ordering::Relaxed);
+        Ok(progress)
+    }
+
+    /// Retain each file error and count it as a failed file.
+    pub(crate) fn failure(&self, error: anyhow::Error) -> Result<()> {
+        self.errors
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Failed to lock file errors: {e}"))?
+            .push(format!("{error:#}"));
+        self.update(|p| p.failed_files += 1)
+            .context("Failed to record file failure")
+    }
+
+    /// Copy the complete error list for the final report.
+    pub(crate) fn errors(&self) -> Result<Vec<String>> {
+        Ok(self
+            .errors
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Failed to read file errors: {e}"))?
+            .clone())
+    }
+}
