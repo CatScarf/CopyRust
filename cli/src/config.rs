@@ -156,3 +156,51 @@ impl Configuration {
             .context("Progress interval must be a positive millisecond duration")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    /// Repeated pairs retain both mappings and every source/destination spelling.
+    #[test]
+    fn repeated_pairs_are_one_batch() -> Result<()> {
+        let cli = Cli::try_parse_from([
+            "copyrust",
+            "--pair",
+            "a",
+            "b",
+            "--pair",
+            "c",
+            "d",
+            "--compare",
+            "hash",
+        ])?;
+        let (jobs, _) = Configuration::load(&cli)?;
+        anyhow::ensure!(
+            jobs.len() == 2 && jobs.iter().all(|job| job.options.compare == Compare::Hash)
+        );
+        anyhow::ensure!(jobs[1].destination == PathBuf::from("d"));
+        Ok(())
+    }
+
+    /// Defaults, job overrides, and explicit CLI flags have predictable precedence.
+    #[test]
+    fn configuration_overrides_are_explicit() -> Result<()> {
+        let root = tempfile::tempdir().context("Failed to create config fixture")?;
+        let config = root.path().join("copy.toml");
+        fs::write(&config, "[defaults]\ncompare='hash'\nexclude_dirs=['cache']\n[run]\nprogress_interval_ms=900\n[[jobs]]\nsource='a'\ndestination='b'\nrecursive=false\nexclude_dirs=['build']\n").context("Failed to write config fixture")?;
+        let cli = Cli::try_parse_from([
+            std::ffi::OsString::from("copyrust"),
+            "--config".into(),
+            config.into_os_string(),
+            "--compare".into(),
+            "auto".into(),
+        ])?;
+        let (jobs, options) = Configuration::load(&cli)?;
+        anyhow::ensure!(jobs[0].options.compare == Compare::Auto && !jobs[0].options.recursive);
+        anyhow::ensure!(jobs[0].options.exclude_dirs == ["cache", "build"]);
+        anyhow::ensure!(options.progress_interval_ms == 900);
+        Ok(())
+    }
+}

@@ -10,6 +10,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: copyrust-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     strategy:
@@ -47,6 +51,7 @@ jobs:
           cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
           cargo test --locked --workspace
           cargo build --locked --release -p copyrust-cli
+          mkdir -p temp/native temp/wheels
       - name: Check Python typing and formatting
         shell: bash
         run: |

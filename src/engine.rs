@@ -1,7 +1,7 @@
 use crate::{
     CopyJob, Progress, RunOptions, Summary,
     io::{Content, Paths},
-    plan::Plan,
+    plan::{Entry, Plan},
     state::{Cancellation, State},
 };
 use anyhow::{Context, Result, bail};
@@ -89,25 +89,7 @@ impl CopyEngine {
     /// Complete planning and comparison before any writes, then purge only on success.
     fn execute(jobs: &[CopyJob], options: &RunOptions, state: &State) -> Result<()> {
         let plan = Plan::build(jobs, options.scan_workers, state)?;
-        state.update(|p| {
-            p.phase = "comparing".into();
-            p.total_files = Some(plan.files.len() as u64);
-        })?;
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(options.hash_workers)
-            .build()
-            .context("Failed to start hash workers")?;
-        let selections: Vec<bool> = pool.install(|| {
-            plan.files
-                .par_iter()
-                .map(|entry| {
-                    let result = Content::needs_copy(entry, &plan.jobs[entry.job].options, state)
-                        .with_context(|| format!("Failed to compare {}", entry.source.display()));
-                    state.update(|p| p.compared_files += 1)?;
-                    result
-                })
-                .collect::<Result<_>>()
-        })?;
+        let selections = Self::compare(&plan, options, state)?;
         let selected: Vec<_> = plan
             .files
             .iter()
@@ -131,6 +113,48 @@ impl CopyEngine {
         if options.dry_run {
             return Ok(());
         }
+        Self::copy_selected(&selected, &plan, options, state)?;
+        state
+            .cancellation
+            .check()
+            .context("Copy cancelled before cleanup")?;
+        if state.errors()?.is_empty() {
+            Self::purge(&plan, state)?;
+        }
+        Ok(())
+    }
+
+    /// Compare selected files in bounded parallel workers without mutating outputs.
+    fn compare(plan: &Plan, options: &RunOptions, state: &State) -> Result<Vec<bool>> {
+        state.update(|p| {
+            p.phase = "comparing".into();
+            p.total_files = Some(plan.files.len() as u64);
+        })?;
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(options.hash_workers)
+            .build()
+            .context("Failed to start hash workers")?;
+        pool.install(|| {
+            plan.files
+                .par_iter()
+                .map(|entry| {
+                    let result = Content::needs_copy(entry, &plan.jobs[entry.job].options, state)
+                        .with_context(|| format!("Failed to compare {}", entry.source.display()));
+                    state.update(|p| p.compared_files += 1)?;
+                    result
+                })
+                .collect::<Result<_>>()
+        })
+        .context("Failed to compare batch inputs")
+    }
+
+    /// Copy planned differences using the batch-wide copy worker limit.
+    fn copy_selected(
+        selected: &[&Entry],
+        plan: &Plan,
+        options: &RunOptions,
+        state: &State,
+    ) -> Result<()> {
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(options.copy_workers)
             .build()
@@ -146,15 +170,8 @@ impl CopyEngine {
                     ),
                 }
             })
-        })?;
-        state
-            .cancellation
-            .check()
-            .context("Copy cancelled before cleanup")?;
-        if state.errors()?.is_empty() {
-            Self::purge(&plan, state)?;
-        }
-        Ok(())
+        })
+        .context("Failed to execute selected copies")
     }
 
     /// Retry a failed file operation while preserving the last contextual error.
