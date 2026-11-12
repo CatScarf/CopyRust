@@ -6,6 +6,11 @@ on:
     tags: ['v*']
   pull_request:
   workflow_dispatch:
+    inputs:
+      artifact_run_id:
+        description: Existing validated run to publish Python wheels from; empty runs checks
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -16,6 +21,7 @@ concurrency:
 
 jobs:
   build:
+    if: github.event_name != 'workflow_dispatch' || inputs.artifact_run_id == ''
     strategy:
       fail-fast: false
       matrix:
@@ -125,6 +131,28 @@ jobs:
           path: temp/wheels
           merge-multiple: true
       - name: Publish Python wheels
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: temp/wheels
+
+  publish-existing-python:
+    if: github.event_name == 'workflow_dispatch' && inputs.artifact_run_id != ''
+    runs-on: ubuntu-24.04
+    environment:
+      name: pypi
+      url: https://pypi.org/project/copyrust/
+    permissions:
+      actions: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: copyrust-wheel-*
+          path: temp/wheels
+          merge-multiple: true
+          run-id: ${{ inputs.artifact_run_id }}
+          github-token: ${{ github.token }}
+      - name: Publish validated Python wheels
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: temp/wheels
