@@ -53,6 +53,7 @@ impl Plan {
                 }
             }
         }
+        Self::validate_parents(&trees, &destinations)?;
         let mut removals = Vec::new();
         for (index, tree) in trees.iter().enumerate() {
             removals.extend(
@@ -69,6 +70,39 @@ impl Plan {
         })
     }
 
+    /// Check shared destination ancestors once before any comparison or write.
+    fn validate_parents(trees: &[Tree], destinations: &HashSet<String>) -> Result<()> {
+        let mut inspected = HashSet::new();
+        for entry in trees.iter().flat_map(|tree| &tree.files) {
+            let mut parent = entry.destination.parent();
+            while let Some(path) = parent {
+                let key = Paths::key(path);
+                if destinations.contains(&key) {
+                    bail!(
+                        "Destination file conflicts with another mapping's directory: {}",
+                        path.display()
+                    );
+                }
+                if !inspected.insert(key) {
+                    break;
+                }
+                Paths::guard(path).context("Failed to inspect destination ancestor")?;
+                if path
+                    .try_exists()
+                    .context("Failed to inspect destination ancestor existence")?
+                    && !path.is_dir()
+                {
+                    bail!(
+                        "Destination ancestor is not a directory: {}",
+                        path.display()
+                    );
+                }
+                parent = path.parent();
+            }
+        }
+        Ok(())
+    }
+
     /// Canonicalize existing parents and protect all sources from destination writes.
     fn normalize(jobs: &[CopyJob]) -> Result<Vec<CopyJob>> {
         if jobs.is_empty() {
@@ -76,10 +110,15 @@ impl Plan {
         }
         let mut result = Vec::new();
         for job in jobs {
-            Paths::guard(&job.source).context("Failed to validate source path")?;
+            let metadata =
+                fs::symlink_metadata(&job.source).context("Failed to inspect source root")?;
+            if Paths::is_link(&metadata) {
+                bail!("Source root must not be a link: {}", job.source.display());
+            }
             let mut job = job.clone();
             job.source = fs::canonicalize(&job.source)
                 .with_context(|| format!("Failed to resolve source {}", job.source.display()))?;
+            Paths::guard(&job.source).context("Failed to validate resolved source path")?;
             if !job.source.is_dir() {
                 bail!("Source is not a directory: {}", job.source.display());
             }

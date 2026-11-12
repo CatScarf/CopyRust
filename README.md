@@ -110,7 +110,9 @@ replaced. Modification times and basic permission bits are preserved by default.
 This is not a filesystem snapshot: writers must not modify inputs concurrently,
 especially while deliberately preserving their size and timestamps.
 
-Source/destination tree overlap and duplicate destination files are rejected.
+Explicit roots are canonicalized, including system ancestor aliases such as macOS
+`/var`; the roots themselves must not be links. Source/destination tree overlap
+and duplicate destination files are rejected.
 Symlinks and Windows reparse points are not followed; source links are skipped and
 destination link traversal is rejected. Existing hard links to the same input are
 skipped. Purge runs only after successful copies, respects filters, protects nested

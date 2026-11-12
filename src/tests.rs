@@ -251,3 +251,88 @@ fn nonrecursive_selection() -> Result<()> {
     ensure!(!fixture.job.destination.join("nested").exists());
     Ok(())
 }
+
+/// A file-to-directory collision across mappings must fail before writes.
+#[test]
+fn prefix_collisions_fail_before_mutations() -> Result<()> {
+    let fixture = Fixture::new()?;
+    Fixture::put(&fixture.job.source, "nested", b"file")?;
+    let other_source = fixture._root.path().join("other");
+    Fixture::put(&other_source, "file", b"nested")?;
+    let other = CopyJob::new(other_source, fixture.job.destination.join("nested"));
+    let summary = CopyEngine::run(
+        &[fixture.job.clone(), other],
+        &RunOptions::default(),
+        Cancellation::default(),
+        |_| Ok(()),
+    )?;
+    ensure!(!summary.success() && !fixture.job.destination.join("nested").exists());
+    Ok(())
+}
+
+/// Read-only destination files can be replaced without losing full source contents.
+#[test]
+fn readonly_destination_can_be_replaced() -> Result<()> {
+    let fixture = Fixture::new()?;
+    Fixture::put(&fixture.job.source, "file", b"new complete contents")?;
+    Fixture::put(&fixture.job.destination, "file", b"old")?;
+    let path = fixture.job.destination.join("file");
+    let mut permissions = fs::metadata(&path)?.permissions();
+    permissions.set_readonly(true);
+    fs::set_permissions(&path, permissions)?;
+    let summary = fixture.run()?;
+    ensure!(summary.success(), "Copy failed: {:?}", summary.errors);
+    ensure!(fs::read(path)? == b"new complete contents");
+    Ok(())
+}
+
+/// Identical hard-link identities are skipped even in forced-copy mode.
+#[test]
+fn same_file_identity_is_not_overwritten() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    fixture.job.options.compare = Compare::Always;
+    Fixture::put(&fixture.job.source, "file", b"contents")?;
+    fs::hard_link(
+        fixture.job.source.join("file"),
+        fixture.job.destination.join("file"),
+    )?;
+    let summary = fixture.run()?;
+    ensure!(summary.success() && summary.progress.skipped_same_file == 1);
+    ensure!(fs::read(fixture.job.source.join("file"))? == b"contents");
+    Ok(())
+}
+
+/// A planning failure prevents both ordinary copies and destructive cleanup.
+#[test]
+fn failed_batch_never_purges() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    fixture.job.options.purge = true;
+    Fixture::put(&fixture.job.source, "file", b"new")?;
+    Fixture::put(&fixture.job.destination, "extra", b"retain")?;
+    let summary = CopyEngine::run(
+        &[fixture.job.clone(), fixture.job.clone()],
+        &RunOptions::default(),
+        Cancellation::default(),
+        |_| Ok(()),
+    )?;
+    ensure!(!summary.success());
+    ensure!(fixture.job.destination.join("extra").exists());
+    Ok(())
+}
+
+/// Source links are skipped and destination directory links are rejected.
+#[cfg(unix)]
+#[test]
+fn links_do_not_escape_roots() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let external = fixture._root.path().join("external");
+    Fixture::put(&external, "file", b"retain")?;
+    std::os::unix::fs::symlink(&external, fixture.job.source.join("source-link"))?;
+    let summary = fixture.run()?;
+    ensure!(summary.success() && summary.progress.skipped_links == 1);
+    Fixture::put(&fixture.job.source, "nested/file", b"replace")?;
+    std::os::unix::fs::symlink(&external, fixture.job.destination.join("nested"))?;
+    ensure!(!fixture.run()?.success());
+    ensure!(fs::read(external.join("file"))? == b"retain");
+    Ok(())
+}

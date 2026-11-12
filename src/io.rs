@@ -10,6 +10,41 @@ use std::{
 pub(crate) struct Paths;
 
 impl Paths {
+    /// Atomically replace existing files and restore read-only flags after a failed move.
+    pub(crate) fn replace(temporary: tempfile::NamedTempFile, destination: &Path) -> Result<()> {
+        #[cfg(windows)]
+        let previous = match fs::metadata(destination) {
+            Ok(metadata) if metadata.permissions().readonly() => {
+                let original = metadata.permissions();
+                let mut writable = original.clone();
+                #[allow(
+                    clippy::permissions_set_readonly_false,
+                    reason = "This branch only clears the Windows read-only attribute."
+                )]
+                writable.set_readonly(false);
+                fs::set_permissions(destination, writable)
+                    .context("Failed to make destination writable")?;
+                Some(original)
+            }
+            Ok(_) => None,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error).context("Failed to inspect destination permissions"),
+        };
+        let result = temporary.persist(destination);
+        #[cfg(windows)]
+        if result.is_err() {
+            if let Some(original) = previous {
+                fs::set_permissions(destination, original).context(
+                    "Failed to restore destination permissions after failed replacement",
+                )?;
+            }
+        }
+        result
+            .map(|_| ())
+            .map_err(|error| error.error)
+            .context("Failed to replace destination atomically")
+    }
+
     /// Produce filesystem comparison keys without changing actual path spellings.
     pub(crate) fn key(path: &Path) -> String {
         let value = path.to_string_lossy().replace('\\', "/");
@@ -51,7 +86,15 @@ impl Paths {
                 _ => normalized.push(component),
             }
         }
-        Self::guard(&normalized)?;
+        match fs::symlink_metadata(&normalized) {
+            Ok(metadata) if Self::is_link(&metadata) => bail!(
+                "Destination root must not be a link: {}",
+                normalized.display()
+            ),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("Failed to inspect destination root"),
+        }
         let mut ancestor = normalized.clone();
         let mut missing = Vec::new();
         while !ancestor
@@ -147,13 +190,18 @@ impl Content {
             .cancellation
             .check()
             .context("Failed to continue comparison")?;
-        Paths::guard(&entry.destination)?;
         let source = fs::metadata(&entry.source).context("Failed to inspect copy source")?;
-        let destination = match fs::metadata(&entry.destination) {
+        let destination = match fs::symlink_metadata(&entry.destination) {
             Ok(value) => value,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
             Err(error) => return Err(error).context("Failed to inspect copy destination"),
         };
+        if Paths::is_link(&destination) {
+            bail!(
+                "Destination link traversal is disabled: {}",
+                entry.destination.display()
+            );
+        }
         if !destination.is_file() {
             bail!("Destination is not a file: {}", entry.destination.display());
         }
@@ -226,10 +274,7 @@ impl Content {
             .context("Failed to preserve modification time")?;
         }
         Paths::guard(&entry.destination)?;
-        temporary
-            .persist(&entry.destination)
-            .map_err(|e| e.error)
-            .context("Failed to replace destination atomically")?;
+        Paths::replace(temporary, &entry.destination)?;
         fs::set_permissions(&entry.destination, before.permissions())
             .context("Failed to preserve destination permissions")?;
         Ok(())
