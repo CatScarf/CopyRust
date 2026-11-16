@@ -56,9 +56,9 @@ impl Plan {
         let index = pool.install(|| Self::index(&trees, &references))?;
         pool.install(|| index.validate(state, &references))?;
         let mut removals = Vec::new();
-        for (index, tree) in trees.iter().enumerate() {
+        for index in 0..trees.len() {
             removals.extend(
-                Self::purge(&jobs, index, tree, state)
+                Self::purge(&jobs, index, &trees, state)
                     .context("Failed to plan destination cleanup")?,
             );
         }
@@ -229,8 +229,14 @@ impl Plan {
     }
 
     /// Plan only selected extras while protecting ignored paths and nested mappings.
-    fn purge(jobs: &[CopyJob], index: usize, tree: &Tree, state: &State) -> Result<Vec<Removal>> {
+    fn purge(
+        jobs: &[CopyJob],
+        index: usize,
+        trees: &[Tree],
+        state: &State,
+    ) -> Result<Vec<Removal>> {
         let job = &jobs[index];
+        let tree = &trees[index];
         if !job.options.purge || !job.destination.exists() {
             return Ok(Vec::new());
         }
@@ -238,9 +244,14 @@ impl Plan {
         let protected: Vec<&Path> = jobs
             .iter()
             .enumerate()
-            .filter(|(i, _)| *i != index)
+            .filter(|(i, other)| {
+                *i != index
+                    && Paths::within(&other.destination, &job.destination)
+                    && Paths::key(&other.destination) != Paths::key(&job.destination)
+            })
             .map(|(_, other)| other.destination.as_path())
             .collect();
+        let retained = Self::shared_outputs(jobs, trees, index);
         let depth = if job.options.recursive { usize::MAX } else { 1 };
         let entries = WalkDir::new(&job.destination)
             .follow_links(false)
@@ -276,7 +287,10 @@ impl Plan {
             let metadata = entry
                 .metadata()
                 .context("Failed to inspect cleanup entry")?;
-            if Paths::is_link(&metadata) || tree.present.contains(&Paths::key(relative)) {
+            if Paths::is_link(&metadata)
+                || tree.present.contains(&Paths::key(relative))
+                || retained.contains(&Paths::key(entry.path()))
+            {
                 continue;
             }
             if (metadata.is_dir() && job.options.recursive)
@@ -289,6 +303,24 @@ impl Plan {
             }
         }
         Ok(result)
+    }
+
+    /// Protect exact outputs of ancestor and equal-root mappings without disabling cleanup.
+    fn shared_outputs(jobs: &[CopyJob], trees: &[Tree], index: usize) -> HashSet<String> {
+        jobs.iter()
+            .zip(trees)
+            .enumerate()
+            .filter(|(i, (other, _))| {
+                *i != index && Paths::within(&jobs[index].destination, &other.destination)
+            })
+            .flat_map(|(_, (_, tree))| {
+                tree.directories
+                    .iter()
+                    .map(PathBuf::as_path)
+                    .chain(tree.files.iter().map(Entry::destination))
+            })
+            .map(Paths::key)
+            .collect()
     }
 }
 

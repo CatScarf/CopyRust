@@ -2,6 +2,48 @@ use crate::{Cancellation, CopyEngine, CopyJob, RunOptions};
 use anyhow::{Context, Result, ensure};
 use std::{fs, path::Path};
 
+/// Ancestor mappings retain their own outputs while nested purge still removes extras.
+#[test]
+fn ancestor_mapping_does_not_disable_nested_purge() -> Result<()> {
+    for shared in [false, true] {
+        let fixture = Fixture::new()?;
+        let source = fixture.root.path().join("source");
+        let extra_source = fixture.root.path().join("launchers");
+        let destination = fixture.root.path().join("destination");
+        Fixture::put(&source, "Engine/current", b"current")?;
+        let addon = if shared {
+            "addon/file"
+        } else {
+            "Engine/addon/file"
+        };
+        Fixture::put(&extra_source, addon, b"addon")?;
+        Fixture::put(&destination, "Engine/obsolete", b"old")?;
+        Fixture::put(&destination, "Engine/protected.tmp", b"keep")?;
+        let mut engine = CopyJob::new(source.join("Engine"), destination.join("Engine"));
+        engine.options.purge = true;
+        engine.options.exclude_files.push("*.tmp".into());
+        let other_target = if shared {
+            destination.join("Engine")
+        } else {
+            destination.clone()
+        };
+        let launchers = CopyJob::new(extra_source, other_target);
+        let summary = CopyEngine::run(
+            &[engine, launchers],
+            &RunOptions::default(),
+            Cancellation::default(),
+            |_| Ok(()),
+        )?;
+        ensure!(summary.success(), "Batch failed: {:?}", summary.errors);
+        ensure!(!destination.join("Engine/obsolete").exists());
+        ensure!(destination.join("Engine/protected.tmp").exists());
+        ensure!(destination.join("Engine/current").exists());
+        ensure!(destination.join("Engine/addon/file").exists());
+        ensure!(summary.progress.deleted_files == 1);
+    }
+    Ok(())
+}
+
 struct Fixture {
     root: tempfile::TempDir,
 }
