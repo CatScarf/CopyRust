@@ -150,6 +150,8 @@ macro_rules! progress_getters {
             fn to_json(&self) -> PyResult<String> {
                 serde_json::to_string(&self.value).map_err(|error| PyRuntimeError::new_err(format!("Failed to serialize progress: {error}")))
             }
+            /// Format one cumulative batch line for timestamped application logging.
+            fn format_line(&self) -> String { self.value.format_line() }
         }
     };
 }
@@ -158,7 +160,7 @@ progress_getters! {
     phase: String, elapsed_seconds: f64, scanned_files: u64, total_files: Option<u64>,
     compared_files: u64, hashed_bytes: u64, copied_files: u64, copied_bytes: u64,
     total_copy_bytes: Option<u64>, skipped_mtime: u64, skipped_hash: u64,
-    skipped_same_file: u64, skipped_links: u64, deleted_files: u64, failed_files: u64,
+    skipped_same_file: u64, skipped_bytes: u64, skipped_links: u64, deleted_files: u64, failed_files: u64,
     planned_copy_files: u64, planned_delete_files: u64, dry_run: bool, complete: bool,
 }
 

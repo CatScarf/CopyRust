@@ -154,3 +154,5 @@ python -m maturin build --release --manifest-path python/Cargo.toml
 
 The release workflow builds six 64-bit native CLI/wheel targets and publishes the
 Rust crates, GitHub binaries, and Python wheels from version tags.
+
+Text progress includes cumulative copy and skip counts and bytes, transfer rate, elapsed time, and ETA. Use `--progress plain --progress-interval 10s` for build logs. Start and final events are also emitted; unknown ETA is shown as `--`. Python callbacks can log `event.format_line()` with `RunOptions(progress_interval_ms=10000)`. The `skipped_bytes` counter counts selected regular files skipped by metadata, content hash, or file identity; excluded files and links are not included.

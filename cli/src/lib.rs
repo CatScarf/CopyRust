@@ -140,17 +140,7 @@ impl Cli {
                 .with_ansi(self.progress == "auto" && std::io::stderr().is_terminal())
                 .finish();
             tracing::subscriber::with_default(subscriber, || {
-                tracing::info!(
-                    phase = %event.phase, scanned = event.scanned_files, compared = event.compared_files,
-                    copied_files = event.copied_files, copied_bytes = event.copied_bytes,
-                    hashed_bytes = event.hashed_bytes, skipped_mtime = event.skipped_mtime,
-                    skipped_hash = event.skipped_hash, deleted = event.deleted_files,
-                total_files = ?event.total_files, total_copy_bytes = ?event.total_copy_bytes,
-                planned_copy_files = event.planned_copy_files, planned_delete_files = event.planned_delete_files,
-                average_mib_per_second = format_args!("{:.2}", event.copied_bytes as f64 / event.elapsed_seconds.max(0.001) / 1048576.0),
-                    failed = event.failed_files, elapsed_seconds = format_args!("{:.3}", event.elapsed_seconds),
-                    "copy progress"
-                )
+                tracing::info!("{}", event.format_line())
             });
         }
         Ok(())

@@ -118,6 +118,8 @@ pub struct Progress {
     pub skipped_mtime: u64,
     pub skipped_hash: u64,
     pub skipped_same_file: u64,
+    #[serde(default)]
+    pub skipped_bytes: u64,
     pub skipped_links: u64,
     pub deleted_files: u64,
     pub failed_files: u64,

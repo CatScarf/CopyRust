@@ -251,7 +251,10 @@ impl Content {
             if same_file::is_same_file(entry.source(), entry.destination())
                 .context("Failed to compare file identities")?
             {
-                state.update(|p| p.skipped_same_file += 1)?;
+                state.update(|p| {
+                    p.skipped_same_file += 1;
+                    p.skipped_bytes += source.len();
+                })?;
                 return Ok(false);
             }
             return Ok(true);
@@ -263,7 +266,10 @@ impl Content {
             .same_time(destination)
             .context("Failed to compare modification times")?;
         if matches!(options.compare, Compare::Mtime | Compare::Auto) && same_time {
-            state.update(|p| p.skipped_mtime += 1)?;
+            state.update(|p| {
+                p.skipped_mtime += 1;
+                p.skipped_bytes += source.len();
+            })?;
             return Ok(false);
         }
         if options.compare == Compare::Mtime {
@@ -277,7 +283,10 @@ impl Content {
                 state,
             )?
         {
-            state.update(|p| p.skipped_hash += 1)?;
+            state.update(|p| {
+                p.skipped_hash += 1;
+                p.skipped_bytes += source.len();
+            })?;
             return Ok(false);
         }
         Ok(true)

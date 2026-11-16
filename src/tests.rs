@@ -74,6 +74,7 @@ fn hash_skips_timestamp_only_changes() -> Result<()> {
     ensure!(
         summary.success()
             && summary.progress.skipped_hash == 1
+            && summary.progress.skipped_bytes == 4
             && summary.progress.copied_files == 0
     );
     ensure!(
@@ -100,6 +101,7 @@ fn metadata_modes_have_explicit_shortcuts() -> Result<()> {
         ensure!(
             summary.success()
                 && summary.progress.skipped_mtime == 1
+                && summary.progress.skipped_bytes == 4
                 && summary.progress.hashed_bytes == 0
         );
     }

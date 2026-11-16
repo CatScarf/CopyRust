@@ -9,6 +9,7 @@ mod index;
 mod io;
 mod model;
 mod plan;
+mod progress;
 mod state;
 #[cfg(windows)]
 mod windows;
