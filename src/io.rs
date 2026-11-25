@@ -1,6 +1,6 @@
 use crate::{Compare, CopyOptions, HashAlgorithm};
 use crate::{hashing, plan, state};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use std::fs::{self, File, Metadata};
 use std::io::Read;
 #[cfg(not(windows))]
@@ -174,17 +174,20 @@ impl Paths {
 pub(crate) struct Content;
 
 impl Content {
-    /// Read a complete digest while checking cancellation and source stability.
-    fn digest(
+    /// Hash the opened file against fresh metadata, then check for changes.
+    fn digest_if_unchanged(
         path: &Path,
-        before: &crate::filesystem::Snapshot,
         algorithm: HashAlgorithm,
         state: &state::State,
-    ) -> Result<hashing::Digest> {
+    ) -> Result<Option<(hashing::Digest, u64)>> {
         let mut file = File::open(path)
             .with_context(|| format!("Failed to open hash input {}", path.display()))?;
+        let before = file
+            .metadata()
+            .with_context(|| format!("Failed to read metadata of hash input {}", path.display()))?;
+        let size = before.len();
         let mut hash = hashing::ContentHash::new(algorithm);
-        let mut buffer = vec![0u8; before.len().clamp(1, 512 * 1024) as usize];
+        let mut buffer = vec![0u8; size.clamp(1, 512 * 1024) as usize];
         loop {
             state
                 .cancellation
@@ -199,26 +202,22 @@ impl Content {
             hash.update(&buffer[..count]);
             state.hashed.fetch_add(count as u64, Ordering::Relaxed);
         }
-        Self::unchanged(
+        let unchanged = Self::metadata_matches(
             path,
-            before.len(),
+            size,
             before
                 .modified()
                 .context("Failed to read digest input mtime")?,
         )
-        .context("Hash input changed during comparison")?;
-        Ok(hash.finish())
+        .with_context(|| format!("Failed to validate hash input {}", path.display()))?;
+        Ok(unchanged.then(|| (hash.finish(), size)))
     }
 
-    /// Reject observed mutations instead of silently accepting a partial file.
-    fn unchanged(path: &Path, size: u64, modified: std::time::SystemTime) -> Result<()> {
+    /// Check whether current file metadata still matches its snapshot.
+    fn metadata_matches(path: &Path, size: u64, modified: std::time::SystemTime) -> Result<bool> {
         let after = fs::metadata(path).context("Failed to recheck file metadata")?;
-        if size != after.len()
-            || modified != after.modified().context("Failed to read final mtime")?
-        {
-            bail!("File changed during operation: {}", path.display());
-        }
-        Ok(())
+        Ok(size == after.len()
+            && modified == after.modified().context("Failed to read final mtime")?)
     }
 
     /// Classify files using size, optional timestamp shortcuts, and strict full digests.
@@ -275,17 +274,19 @@ impl Content {
         if options.compare == Compare::Mtime {
             return Ok(true);
         }
-        if Self::digest(entry.source(), source, options.hash_algorithm, state)?
-            == Self::digest(
-                entry.destination(),
-                destination,
-                options.hash_algorithm,
-                state,
-            )?
-        {
+        let Some((source_hash, source_size)) =
+            Self::digest_if_unchanged(entry.source(), options.hash_algorithm, state)
+                .context("Failed to hash source")?
+        else {
+            return Ok(true);
+        };
+        let destination_hash =
+            Self::digest_if_unchanged(entry.destination(), options.hash_algorithm, state)
+                .context("Failed to hash destination")?;
+        if destination_hash == Some((source_hash, source_size)) {
             state.update(|p| {
                 p.skipped_hash += 1;
-                p.skipped_bytes += source.len();
+                p.skipped_bytes += source_size;
             })?;
             return Ok(false);
         }
@@ -351,7 +352,7 @@ impl Content {
         temporary: Option<tempfile::TempPath>,
     ) -> Result<()> {
         let output = temporary.as_deref().unwrap_or(entry.destination());
-        Self::unchanged(
+        let unchanged = Self::metadata_matches(
             entry.source(),
             before.len(),
             before
@@ -359,6 +360,11 @@ impl Content {
                 .context("Failed to read copied source mtime")?,
         )
         .context("Failed to validate copied source")?;
+        ensure!(
+            unchanged,
+            "Failed to validate copied source: File changed during operation: {}",
+            entry.source().display()
+        );
         #[cfg(not(windows))]
         if options.preserve_mtime {
             filetime::set_file_mtime(

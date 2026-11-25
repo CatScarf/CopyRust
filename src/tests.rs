@@ -87,6 +87,34 @@ fn hash_skips_timestamp_only_changes() -> Result<()> {
     Ok(())
 }
 
+/// Hashing uses fresh metadata when either hard-linked directory entry is stale.
+#[cfg(windows)]
+#[test]
+fn hash_comparison_tolerates_stale_hard_link_metadata() -> Result<()> {
+    for compare in [Compare::Auto, Compare::Hash] {
+        for stale_source in [true, false] {
+            let mut fixture = Fixture::new()?;
+            fixture.job.options.compare = compare;
+            Fixture::put(&fixture.job.source, "binary", b"same")?;
+            Fixture::put(&fixture.job.destination, "binary", b"same")?;
+            let source = fixture.job.source.join("binary");
+            let destination = fixture.job.destination.join("binary");
+            Fixture::time(&source, 1_690_000_000)?;
+            Fixture::time(&destination, 1_690_000_100)?;
+            let alias = fixture._root.path().join("alias");
+            let stale = if stale_source { &source } else { &destination };
+            fs::hard_link(stale, &alias).context("Failed to create fixture hard link")?;
+            Fixture::time(&alias, 1_690_000_200)?;
+
+            let summary = fixture.run()?;
+            ensure!(summary.success(), "Copy failed: {:?}", summary.errors);
+            ensure!(summary.progress.skipped_hash == 1 && summary.progress.skipped_bytes == 4);
+            ensure!(summary.progress.copied_files == 0);
+        }
+    }
+    Ok(())
+}
+
 /// Timestamp and auto modes intentionally shortcut equal-size equal-time contents.
 #[test]
 fn metadata_modes_have_explicit_shortcuts() -> Result<()> {
